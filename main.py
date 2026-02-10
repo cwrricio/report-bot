@@ -8,25 +8,30 @@ import json
 
 app = FastAPI()
 
-# --- Configurações ---
+# --- Configurações e Variáveis de Ambiente ---
 DB_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
-# Token da Whapi (Você pega no painel deles, no topo ou em Configurações)
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN") 
 
-# Conecta ao Redis
+# --- Conexão com Redis ---
 try:
+    # decode_responses=True faz o Redis devolver strings (texto) ao invés de bytes
     r = redis.from_url(REDIS_URL, decode_responses=True)
-except:
-    print("Aviso: Redis não conectado (verifique a variável REDIS_URL)")
+except Exception as e:
+    print(f"Aviso: Redis não conectado: {e}")
     r = None
 
-# Opções da Enquete
-OPCOES = {"1": "Bundudo", "2": "Divo", "3": "Todas as alternativas"}
+# --- Opções da Enquete (Atualizado) ---
+# O texto à direita é o que será salvo no banco e enviado na resposta
+OPCOES = {
+    "1": "Bundudo", 
+    "2": "Divo", 
+    "3": "Divo e Bundudo" 
+}
 
-# --- Função de Envio (Adaptada para Whapi) ---
+# --- Função Auxiliar: Enviar Mensagem via Whapi ---
 def send_whapi_message(chat_id, message):
-    """Envia mensagem usando a Whapi.cloud"""
+    """Envia mensagem de texto usando a API da Whapi.cloud"""
     url = "https://gate.whapi.cloud/messages/text"
     
     headers = {
@@ -35,118 +40,130 @@ def send_whapi_message(chat_id, message):
     }
     
     payload = {
-        "to": chat_id, # Whapi precisa do ID completo (ex: 551199...@s.whatsapp.net)
-        "body": message,
+        "to": chat_id, 
+        "body": message, 
         "typing_time": 0
     }
     
     try:
-        print(f"📤 Enviando para {chat_id}: {message}")
+        # Enviamos o POST para a Whapi
         response = requests.post(url, headers=headers, json=payload)
-        # Se der erro 4xx ou 5xx, vai avisar no log
+        
+        # Se der erro (400 ou 500), avisamos no log
         if response.status_code >= 400:
-            print(f"❌ Erro Whapi: {response.text}")
+            print(f"❌ Erro Whapi ({response.status_code}): {response.text}")
     except Exception as e:
         print(f"❌ Erro de conexão ao enviar: {e}")
 
+# --- Rota Inicial (Health Check básico) ---
 @app.get("/")
 def home():
-    return {"status": "Bot Whapi Online 🚀"}
+    return {"status": "Bot Whapi do Ciocca Online 🚀"}
 
-# --- ROTA DO WEBHOOK (Simplificada) ---
+@app.get("/health")
+def health_check():
+    # Retorno simples para o Railway saber que o app não travou
+    return {"status": "ok"}
+
+# --- ROTA DO WEBHOOK (Cérebro do Bot) ---
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     try:
+        # Lê o JSON que a Whapi mandou
         body = await request.json()
         
-        # A Whapi manda uma lista de 'messages'
+        # A Whapi envia uma lista de mensagens dentro de 'messages'
         messages = body.get("messages", [])
         
-        # Se não tiver mensagem (pode ser evento de status), ignora
+        # Se a lista estiver vazia (pode ser atualização de status), ignoramos
         if not messages:
             return {"status": "ignored"}
 
         for message_data in messages:
-            # Ignora se for mensagem que EU mesmo enviei (from_me)
+            # 1. Ignora mensagens enviadas por mim mesmo (para não entrar em loop)
             if message_data.get("from_me"):
                 continue
 
-            # Pega o ID de quem mandou (ex: 55559999@s.whatsapp.net)
-            chat_id = message_data.get("chat_id")
+            # 2. Extrai dados importantes
+            chat_id = message_data.get("chat_id") # ID único do usuário (ex: 5511999...@s.whatsapp.net)
+            text_body = message_data.get("text", {}).get("body", "") # O texto da mensagem
+            nome = message_data.get("from_name", "Anônimo") # Nome do contato
             
-            # Pega o texto. A Whapi põe o texto dentro de 'text' -> 'body'
-            text_body = message_data.get("text", {}).get("body", "")
-            
+            # Se não tiver texto (ex: mandou só foto sem legenda), ignora
             if not text_body:
-                continue # Pula se for imagem/audio sem legenda
+                continue
 
-            texto = text_body.strip().lower()
-            
-            # Pega o nome do contato (opcional)
-            nome = message_data.get("from_name", "Anônimo")
+            texto = text_body.strip().lower() # Limpa espaços e deixa minúsculo
 
             print(f"📩 Recebido de {nome}: {texto}")
 
-            # --- LÓGICA DA ENQUETE (Redis + Postgres) ---
+            # --- MÁQUINA DE ESTADOS (REDIS) ---
             if r:
+                # Cria uma chave única para esse usuário
                 state_key = f"voto:{chat_id}:status"
+                
+                # Pergunta ao Redis: "Em que passo esse cara está?"
                 estado_atual = r.get(state_key)
 
-                # CENÁRIO 1: Início
+                # CENÁRIO A: Usuário Novo (Não tem estado no Redis)
+                # Qualquer coisa que ele mandar, o bot inicia a enquete.
                 if not estado_atual:
+                    # Salva no Redis que ele está "pensando" (expira em 300 segundos/5 min)
                     r.set(state_key, "AGUARDANDO_VOTO", ex=300)
-                    msg = "🧐 *Enquete Oficial*\nO que o Ciocca é?\n1️⃣ - Bundudo\n2️⃣ - Divo\n3️⃣ - Todas\n_(Responda com o número)_"
+                    
+                    msg = (
+                        "🧐 *Enquete Oficial*\n"
+                        "O que o Ciocca é?\n\n"
+                        "1️⃣ - Bundudo\n"
+                        "2️⃣ - Divo\n"
+                        "3️⃣ - Bundudo e Divo\n\n"
+                        "_(Por Favor responda APENAS com o número)_"
+                    )
                     send_whapi_message(chat_id, msg)
                 
-                # CENÁRIO 2: Recebendo o Voto
+                # CENÁRIO B: Usuário já recebeu a pergunta (Estado AGUARDANDO_VOTO)
                 elif estado_atual == "AGUARDANDO_VOTO":
+                    
+                    # Verifica se ele respondeu 1, 2 ou 3
                     if texto in OPCOES:
-                        escolha = OPCOES[texto]
+                        escolha = OPCOES[texto] # Pega o texto bonito ("Divo", "Bundudo", etc)
                         
-                        # Salva no Banco Neon
+                        # --- SALVA NO BANCO (POSTGRES) ---
                         try:
                             conn = psycopg2.connect(DB_URL)
                             cur = conn.cursor()
-                            # Garante tabela
-                            cur.execute("CREATE TABLE IF NOT EXISTS votos_ciocca (id SERIAL PRIMARY KEY, nome VARCHAR(100), voto VARCHAR(50), data TIMESTAMP DEFAULT NOW())")
-                            # Insere voto
+                            # Cria a tabela se não existir (segurança)
+                            cur.execute("""
+                                CREATE TABLE IF NOT EXISTS votos_ciocca (
+                                    id SERIAL PRIMARY KEY, 
+                                    nome VARCHAR(100), 
+                                    voto VARCHAR(100), 
+                                    data TIMESTAMP DEFAULT NOW()
+                                )
+                            """)
+                            # Insere o voto
                             cur.execute("INSERT INTO votos_ciocca (nome, voto) VALUES (%s, %s)", (nome, escolha))
                             conn.commit()
+                            cur.close()
                             conn.close()
-                            print("✅ Voto salvo no Postgres")
+                            print(f"✅ Voto salvo: {escolha}")
                         except Exception as e:
                             print(f"❌ Erro Postgres: {e}")
 
-                        # Limpa estado e agradece
+                        # --- ENCERRAMENTO ---
+                        # Deleta a chave do Redis. O bot "esquece" que estava falando com ele.
+                        # Assim, a sessão encerra e não ocupa memória à toa.
                         r.delete(state_key)
-                        send_whapi_message(chat_id, f"✅ Registrado! Ciocca é *{escolha}*.")
+                        
+                        # Envia confirmação final
+                        send_whapi_message(chat_id, f"✅ Registrado! O Ciocca é *{escolha}*.")
                     
                     else:
+                        # Se ele estava aguardando voto mas mandou "batata" ou "4"
                         send_whapi_message(chat_id, "❌ Opção inválida! Digite apenas 1, 2 ou 3.")
 
     except Exception as e:
-        print(f"❌ Erro Geral: {e}")
+        print(f"❌ Erro Geral no Webhook: {e}")
         return {"status": "error"}
     
     return {"status": "ok"}
-
-@app.get("/health")
-def health_check():
-    status = {"api": "online", "postgres": "disconnected", "redis": "disconnected"}
-    
-    # Testa Redis
-    try:
-        if r and r.ping():
-            status["redis"] = "connected"
-    except Exception as e:
-        status["redis_error"] = str(e)
-
-    # Testa Postgres
-    try:
-        conn = psycopg2.connect(DB_URL)
-        conn.close()
-        status["postgres"] = "connected"
-    except Exception as e:
-        status["postgres_error"] = str(e)
-
-    return status
