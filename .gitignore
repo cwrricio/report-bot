@@ -1,0 +1,15 @@
+_pycache_
+docker-compose*.yml
+.env
+.vscode/
+.idea/
+*.log
+*.sqlite3
+*.pyc
+.DS_Store
+node_modules/
+dist/
+build/
+*.egg-info/
+coverage/
+htmlcov/    
