@@ -49,30 +49,35 @@ def create_notion_card(db_id, proj, desc, prio, user):
     response = requests.post(url, headers=headers, json=payload)
     return response.status_code == 200
 
-# --- Função: Enviar Enquete (Poll) ---
-# --- Função: Enviar Enquete (Poll) ---
-def send_whapi_poll(chat_id, question, options):
+# --- Função: Enviar Lista Interativa (Menu) ---
+def send_whapi_list(chat_id, header_text, body_text, button_title, sections):
     """
-    Envia uma enquete de escolha única (comportamento similar a botões)
-    - question: texto da pergunta / mensagem que aparece acima das opções
-    - options: lista de strings (2 a 12 opções)
+    Envia mensagem interativa do tipo LIST (menu dropdown).
+    - sections: lista de dicts com 'title' (opcional) e 'rows' (lista de dicts com 'id', 'title', 'description' opcional)
     """
-    url = "https://gate.whapi.cloud/messages/poll"
-
-    if len(options) < 2 or len(options) > 12:
-        print("Erro: enquete precisa de 2 a 12 opções")
-        send_whapi_text(chat_id, "Erro interno: número inválido de opções. Tente novamente.")
-        return False
-
-    # Limita cada opção (WhatsApp ~25-30 chars por opção)
-    formatted_options = [opt.strip()[:25] for opt in options]
+    url = "https://gate.whapi.cloud/messages/interactive"
 
     payload = {
         "to": chat_id,
-        "title": question,               # mensagem + pergunta
-        "options": formatted_options,
-        "count": 1                       # 1 = single choice
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "header": {
+                "type": "text",
+                "text": header_text[:60]  # limite aproximado
+            },
+            "body": {
+                "text": body_text[:1024]
+            },
+            "action": {
+                "button": button_title[:20],  # título do botão que abre a lista
+                "sections": sections          # lista de seções com rows
+            }
+        }
     }
+
+    # Opcional: adicionar footer
+    # "footer": {"text": "Selecione uma opção abaixo"}
 
     headers = {
         "Authorization": f"Bearer {WHAPI_TOKEN}",
@@ -82,29 +87,23 @@ def send_whapi_poll(chat_id, question, options):
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10)
-        print(f"Resposta Whapi (poll): {response.status_code} - {response.text}")
+        print(f"Resposta Whapi (list): {response.status_code} - {response.text}")
         if response.status_code not in (200, 201):
-            print(f"Payload enviado: {payload}")  # ← ajuda a depurar
+            print(f"Payload enviado (debug): {payload}")
         return response.status_code in (200, 201)
     except Exception as e:
-        print(f"Erro ao enviar enquete: {e}")
-        send_whapi_text(chat_id, "Ocorreu um erro ao enviar a enquete. Tente novamente.")
+        print(f"Erro ao enviar lista: {e}")
+        send_whapi_text(chat_id, "Ocorreu um erro ao enviar o menu. Tente novamente.")
         return False
 
-# --- Função: Enviar Mensagem de Texto (Whapi) ---
+# --- Função: Enviar Mensagem de Texto ---
 def send_whapi_text(chat_id, text):
-    """Envia mensagem de texto simples"""
     url = "https://gate.whapi.cloud/messages/text"
-    payload = {
-        "to": chat_id,
-        "body": text
-    }
-    
+    payload = {"to": chat_id, "body": text}
     headers = {
         "Authorization": f"Bearer {WHAPI_TOKEN}",
         "Content-Type": "application/json"
     }
-    
     response = requests.post(url, headers=headers, json=payload)
     print(f"Resposta Whapi (texto): {response.status_code} - {response.text}")
     return response
@@ -120,32 +119,27 @@ async def handle_flow(request: Request):
         return {"status": "ok"}
 
     for msg in messages:
-        # Ignora mensagens enviadas pelo bot
         if msg.get("from_me"):
             continue
             
         chat_id = msg.get("chat_id")
         user_name = msg.get("from_name", "Anônimo")
         
-        # Verifica o tipo de mensagem
         msg_type = msg.get("type", "")
         
-        # Captura o conteúdo baseado no tipo
         content = None
         
-        # Se for mensagem de texto normal (inclui resposta de enquete na maioria dos casos)
-        if msg_type == "text":
-            content = msg.get("text", {}).get("body", "").strip()
+        # Captura resposta de lista interativa
+        if msg_type == "interactive":
+            interactive = msg.get("interactive", {})
+            if interactive.get("type") == "list_reply":
+                reply = interactive.get("list_reply", {})
+                content = reply.get("title", "").strip()  # ou reply.get("id") se preferir usar ID
+                print(f"Seleção de lista: {content} (ID: {reply.get('id')})")
         
-        # Se por algum motivo vier como poll (raro), tentamos capturar
-        elif msg_type == "poll":
-            # Caso a Whapi envie atualização de poll - pegamos a escolha se disponível
-            poll_data = msg.get("poll", {})
-            if "selected" in poll_data:
-                content = poll_data.get("selected", "")
-            elif poll_data.get("results"):
-                # Ignoramos resultados agregados por enquanto
-                pass
+        # Mensagem de texto normal
+        elif msg_type == "text":
+            content = msg.get("text", {}).get("body", "").strip()
         
         if not content:
             print(f"Conteúdo vazio ou tipo não suportado: {msg_type}")
@@ -158,21 +152,41 @@ async def handle_flow(request: Request):
         
         print(f"Estado atual: {step}")
 
-        # PASSO 0: Inicia o fluxo
+        # PASSO 0: Inicia fluxo
         if not step:
             r.set(state_key, "SET_PROJ", ex=900)
-            msg_boas_vindas = (
-                f"Olá, *{user_name}*! 🛠️\n\n"
-                "Bem-vindo ao sistema de reportes.\n"
-                "Qual projeto você deseja reportar?"
-            )
-            send_whapi_poll(chat_id, msg_boas_vindas, ["Codefolio", "MentorIA"])
+            header = "Selecione o projeto"
+            body = f"Olá, *{user_name}*! 🛠️\nBem-vindo ao sistema de reportes.\nToque no botão abaixo para escolher:"
+            button_title = "Ver projetos"
+            sections = [
+                {
+                    "title": "Projetos disponíveis",
+                    "rows": [
+                        {"id": "proj_1", "title": "Codefolio", "description": "Reporte para Codefolio"},
+                        {"id": "proj_2", "title": "MentorIA", "description": "Reporte para MentorIA"}
+                    ]
+                }
+            ]
+            send_whapi_list(chat_id, header, body, button_title, sections)
 
         # PASSO 1: Seleção do projeto
         elif step == "SET_PROJ":
             if content not in ["Codefolio", "MentorIA"]:
-                send_whapi_text(chat_id, "⚠️ Por favor, selecione uma das opções da enquete.")
-                send_whapi_poll(chat_id, "Escolha o projeto:", ["Codefolio", "MentorIA"])
+                send_whapi_text(chat_id, "⚠️ Por favor, selecione uma opção válida no menu.")
+                # Reenvia o menu
+                header = "Selecione o projeto"
+                body = "Escolha novamente:"
+                button_title = "Ver projetos"
+                sections = [
+                    {
+                        "title": "Projetos",
+                        "rows": [
+                            {"id": "proj_1", "title": "Codefolio", "description": ""},
+                            {"id": "proj_2", "title": "MentorIA", "description": ""}
+                        ]
+                    }
+                ]
+                send_whapi_list(chat_id, header, body, button_title, sections)
                 continue
             
             r.set(f"data:{chat_id}:proj", content, ex=900)
@@ -180,29 +194,53 @@ async def handle_flow(request: Request):
             msg_desc = (
                 f"Projeto *{content}* selecionado! 📝\n\n"
                 "Agora descreva o problema ou melhoria com detalhes "
-                "(em uma única mensagem, por favor)."
+                "(em uma única mensagem)."
             )
             send_whapi_text(chat_id, msg_desc)
 
-        # PASSO 2: Descrição do problema
+        # PASSO 2: Descrição
         elif step == "SET_DESC":
             if len(content) < 10:
-                send_whapi_text(chat_id, "⚠️ Descrição muito curta. Por favor, explique com mais detalhes (mín. 10 caracteres).")
+                send_whapi_text(chat_id, "⚠️ Descrição muito curta (mín. 10 caracteres). Tente novamente.")
                 continue
             
             r.set(f"data:{chat_id}:desc", content, ex=900)
             r.set(state_key, "SET_PRIO", ex=900)
-            msg_prio = (
-                "Entendido! ✅\n\n"
-                "Qual o nível de prioridade/urgência desse reporte?"
-            )
-            send_whapi_poll(chat_id, msg_prio, ["High", "Medium", "Low"])
+            header = "Prioridade do reporte"
+            body = "Qual o nível de urgência?"
+            button_title = "Escolher prioridade"
+            sections = [
+                {
+                    "title": "Níveis de prioridade",
+                    "rows": [
+                        {"id": "prio_h", "title": "High", "description": "Urgente – precisa de atenção imediata"},
+                        {"id": "prio_m", "title": "Medium", "description": "Importante – resolver em breve"},
+                        {"id": "prio_l", "title": "Low", "description": "Normal – pode aguardar"}
+                    ]
+                }
+            ]
+            send_whapi_list(chat_id, header, body, button_title, sections)
 
-        # PASSO 3: Seleção da prioridade
+        # PASSO 3: Prioridade
         elif step == "SET_PRIO":
-            if content not in ["High", "Medium", "Low"]:
-                send_whapi_text(chat_id, "⚠️ Por favor, escolha uma das opções da enquete.")
-                send_whapi_poll(chat_id, "Escolha a prioridade:", ["High", "Medium", "Low"])
+            valid_priorities = ["High", "Medium", "Low"]
+            if content not in valid_priorities:
+                send_whapi_text(chat_id, "⚠️ Por favor, selecione uma prioridade válida no menu.")
+                # Reenvia menu de prioridade
+                header = "Prioridade do reporte"
+                body = "Escolha novamente:"
+                button_title = "Escolher prioridade"
+                sections = [
+                    {
+                        "title": "Níveis",
+                        "rows": [
+                            {"id": "prio_h", "title": "High", "description": ""},
+                            {"id": "prio_m", "title": "Medium", "description": ""},
+                            {"id": "prio_l", "title": "Low", "description": ""}
+                        ]
+                    }
+                ]
+                send_whapi_list(chat_id, header, body, button_title, sections)
                 continue
             
             proj = r.get(f"data:{chat_id}:proj")
@@ -214,18 +252,18 @@ async def handle_flow(request: Request):
             if target_db and create_notion_card(target_db, proj, desc, prio, user_name):
                 msg_confirmacao = (
                     "✅ *Reporte enviado com sucesso!*\n\n"
-                    f"📂 *Projeto:* {proj}\n"
-                    f"👤 *Enviado por:* {user_name}\n"
-                    f"⚡ *Prioridade:* {prio}\n"
-                    f"📝 *Descrição:* {desc}\n\n"
-                    "O card foi adicionado ao backlog no Notion.\n\n"
-                    "Para novo reporte, é só enviar qualquer mensagem! 💬"
+                    f"📂 Projeto: {proj}\n"
+                    f"👤 Enviado por: {user_name}\n"
+                    f"⚡ Prioridade: {prio}\n"
+                    f"📝 Descrição: {desc}\n\n"
+                    "Card adicionado ao backlog no Notion.\n"
+                    "Para novo reporte, envie qualquer mensagem! 💬"
                 )
                 send_whapi_text(chat_id, msg_confirmacao)
             else:
-                send_whapi_text(chat_id, "❌ Erro ao criar card no Notion. Tente novamente mais tarde.")
+                send_whapi_text(chat_id, "❌ Erro ao criar card no Notion. Tente novamente.")
             
-            # Limpa o fluxo
+            # Limpa estado
             r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
 
     return {"status": "ok"}
@@ -233,4 +271,4 @@ async def handle_flow(request: Request):
 # Endpoint de teste
 @app.get("/")
 async def root():
-    return {"status": "Bot de reportes ativo!", "version": "2.1 - com polls"}
+    return {"status": "Bot de reportes ativo!", "version": "2.2 - com List Messages"}
