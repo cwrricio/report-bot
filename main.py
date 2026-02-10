@@ -3,6 +3,7 @@ import redis
 import psycopg2
 import requests
 from fastapi import FastAPI, Request
+import json
 
 app = FastAPI()
 
@@ -14,7 +15,7 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
-# --- Funções auxiliares (Neon + Notion) ---
+# --- Funções auxiliares ---
 def get_project_notion_id(project_name):
     try:
         conn = psycopg2.connect(DB_URL)
@@ -48,17 +49,16 @@ def create_notion_card(db_id, proj, desc, prio, user):
     response = requests.post(url, headers=headers, json=payload)
     return response.status_code == 200
 
-# --- Enviar Poll (Enquete) - Formato correto para Whapi ---
-def send_whapi_poll(chat_id, question, options):
+# --- Enviar Poll (Salva tudo no Redis) ---
+def send_whapi_poll(chat_id, question, options, poll_type="proj"):
     url = "https://gate.whapi.cloud/messages/poll"
-
     formatted_options = [opt.strip()[:25] for opt in options]
 
     payload = {
         "to": chat_id,
-        "title": question,           # texto completo que aparece
+        "title": question,
         "options": formatted_options,
-        "count": 1                   # escolha única
+        "count": 1
     }
 
     headers = {
@@ -67,99 +67,117 @@ def send_whapi_poll(chat_id, question, options):
     }
 
     response = requests.post(url, headers=headers, json=payload)
-    print(f"Resposta Whapi (poll): {response.status_code} - {response.text}")
+    print(f"[POLL] Resposta: {response.status_code} - {response.text}")
+
+    if response.status_code in (200, 201):
+        try:
+            data = response.json()
+            poll_id = data.get("message", {}).get("id")
+            if poll_id:
+                r.set(f"poll:{chat_id}:id", poll_id, ex=1800)
+                r.set(f"poll:{poll_id}:options", json.dumps(formatted_options), ex=1800)
+                r.set(f"poll:{poll_id}:type", poll_type, ex=1800)
+                print(f"[POLL] Salvo no Redis -> ID: {poll_id} | Tipo: {poll_type} | Opções: {formatted_options}")
+        except Exception as e:
+            print(f"[POLL] Erro ao salvar no Redis: {e}")
+
     return response.status_code in (200, 201)
 
-# --- Enviar texto simples ---
+# --- Enviar texto ---
 def send_whapi_text(chat_id, text):
     url = "https://gate.whapi.cloud/messages/text"
     payload = {"to": chat_id, "body": text}
     headers = {"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json"}
     response = requests.post(url, headers=headers, json=payload)
-    print(f"Resposta Whapi (texto): {response.status_code} - {response.text}")
+    print(f"[TEXT] {response.status_code} - {response.text}")
 
-# --- Webhook Principal ---
+# --- Webhook ---
 @app.post("/webhook")
 async def handle_flow(request: Request):
     data = await request.json()
-    print(f"Webhook recebido: {data}")
 
-    messages = data.get("messages", [])
-    if not messages:
-        return {"status": "ok"}
+    items = data.get("messages", []) + data.get("messages_updates", [])
 
-    for msg in messages:
-        if msg.get("from_me"):
+    for item in items:
+        if item.get("from_me", False):
             continue
 
-        chat_id = msg.get("chat_id")
-        user_name = msg.get("from_name", "Anônimo")
-        msg_type = msg.get("type", "")
+        chat_id = item.get("chat_id")
+        user_name = item.get("from_name", "Anônimo")
+        msg_type = item.get("type", "")
 
-        # ==================== CAPTURA MELHORADA DO CONTEÚDO ====================
         content = None
 
-        if msg_type == "text":
-            content = msg.get("text", {}).get("body", "").strip()
+        # === CAPTURA DE VOTO NA ENQUETE ===
+        if msg_type == "action":
+            action = item.get("action", {})
+            if action.get("type") == "vote":
+                votes = action.get("votes", [])
+                poll_id = action.get("target")
 
-        elif msg_type == "poll":
-            poll = msg.get("poll", {})
-            # Formatos mais comuns que a Whapi envia quando o usuário vota
-            if poll.get("selected"):
-                content = poll.get("selected", "")
-            elif poll.get("results"):
-                for option in poll.get("results", []):
-                    if option.get("count", 0) > 0 or option.get("voters"):
-                        content = option.get("name", "")
-                        break
-            elif poll.get("name"):          # fallback
-                content = poll.get("name", "")
+                if votes and poll_id:
+                    vote_id = votes[0]
+
+                    # Faz GET para pegar o nome exato da opção
+                    get_url = f"https://gate.whapi.cloud/messages/{poll_id}"
+                    get_headers = {"Authorization": f"Bearer {WHAPI_TOKEN}"}
+                    try:
+                        get_resp = requests.get(get_url, headers=get_headers, timeout=8)
+                        if get_resp.status_code == 200:
+                            poll_data = get_resp.json()
+                            results = poll_data.get("poll", {}).get("results", [])
+                            for res in results:
+                                if res.get("id") == vote_id:
+                                    content = res.get("name")
+                                    print(f"[VOTO] Sucesso! Opção selecionada: {content} (ID: {vote_id})")
+                                    break
+                    except Exception as e:
+                        print(f"[VOTO] Erro no GET do poll: {e}")
+
+        # === Mensagem de texto normal (descrição) ===
+        elif msg_type == "text":
+            content = item.get("text", {}).get("body", "").strip()
 
         if not content:
-            print(f"Conteúdo não capturado (tipo: {msg_type})")
+            print(f"[IGNORADO] Tipo não processado: {msg_type}")
             continue
 
-        print(f"Conteúdo capturado: {content} | Tipo: {msg_type}")
+        print(f"[CAPTURADO] {content} | Tipo: {msg_type}")
 
         state_key = f"flow:{chat_id}"
         step = r.get(state_key)
 
-        # PASSO 0: Início do fluxo
+        # PASSO 0: Início
         if not step:
             r.set(state_key, "SET_PROJ", ex=900)
-            boas_vindas = (
-                f"Olá, *{user_name}*! 🛠️\n\n"
-                "Bem-vindo ao sistema de reportes.\n"
-                "Qual projeto você quer reportar?"
-            )
-            send_whapi_poll(chat_id, boas_vindas, ["Codefolio", "MentorIA"])
+            msg = f"Olá, *{user_name}*! 🛠️\n\nQual projeto você deseja reportar?"
+            send_whapi_poll(chat_id, msg, ["Codefolio", "MentorIA"], poll_type="proj")
 
-        # PASSO 1: Projeto
+        # PASSO 1: Projeto selecionado
         elif step == "SET_PROJ":
             if content not in ["Codefolio", "MentorIA"]:
                 send_whapi_text(chat_id, "⚠️ Por favor, selecione uma opção na enquete.")
-                send_whapi_poll(chat_id, "Escolha o projeto:", ["Codefolio", "MentorIA"])
+                send_whapi_poll(chat_id, "Escolha o projeto:", ["Codefolio", "MentorIA"], poll_type="proj")
                 continue
 
             r.set(f"data:{chat_id}:proj", content, ex=900)
             r.set(state_key, "SET_DESC", ex=900)
-            send_whapi_text(chat_id, f"✅ Projeto *{content}* selecionado!\n\nAgora descreva o problema ou melhoria com detalhes (em uma única mensagem):")
+            send_whapi_text(chat_id, f"✅ *{content}* selecionado!\n\nAgora descreva o problema ou melhoria com detalhes:")
 
         # PASSO 2: Descrição
         elif step == "SET_DESC":
             if len(content) < 10:
-                send_whapi_text(chat_id, "⚠️ Descrição muito curta. Por favor, explique melhor.")
+                send_whapi_text(chat_id, "⚠️ Descrição muito curta. Por favor, dê mais detalhes.")
                 continue
-
             r.set(f"data:{chat_id}:desc", content, ex=900)
             r.set(state_key, "SET_PRIO", ex=900)
-            send_whapi_poll(chat_id, "Qual a prioridade deste reporte?", ["High", "Medium", "Low"])
+            send_whapi_poll(chat_id, "Qual a prioridade deste reporte?", ["High", "Medium", "Low"], poll_type="prio")
 
         # PASSO 3: Prioridade
         elif step == "SET_PRIO":
             if content not in ["High", "Medium", "Low"]:
                 send_whapi_text(chat_id, "⚠️ Escolha uma prioridade na enquete.")
-                send_whapi_poll(chat_id, "Qual a prioridade?", ["High", "Medium", "Low"])
+                send_whapi_poll(chat_id, "Qual a prioridade?", ["High", "Medium", "Low"], poll_type="prio")
                 continue
 
             proj = r.get(f"data:{chat_id}:proj")
@@ -169,20 +187,22 @@ async def handle_flow(request: Request):
             target_db = get_project_notion_id(proj)
             if target_db and create_notion_card(target_db, proj, desc, prio, user_name):
                 send_whapi_text(chat_id, 
-                    f"✅ *Reporte enviado com sucesso!*\n\n"
+                    f"✅ *Reporte Enviado com Sucesso!*\n\n"
                     f"📂 Projeto: {proj}\n"
                     f"⚡ Prioridade: {prio}\n"
                     f"📝 Descrição: {desc}\n\n"
-                    "Card criado no Notion.\n\n"
-                    "Para fazer outro reporte, é só enviar qualquer mensagem.")
+                    "Card criado no Notion.")
             else:
-                send_whapi_text(chat_id, "❌ Erro ao salvar no Notion. Tente novamente.")
+                send_whapi_text(chat_id, "❌ Erro ao criar o card no Notion.")
 
-            # Limpa estado
+            # Limpeza
             r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
+            poll_id = r.get(f"poll:{chat_id}:id")
+            if poll_id:
+                r.delete(f"poll:{poll_id}:options", f"poll:{poll_id}:type", f"poll:{chat_id}:id")
 
     return {"status": "ok"}
 
 @app.get("/")
 async def root():
-    return {"status": "Bot ativo", "version": "2.3 - Poll otimizado"}
+    return {"status": "Bot de reportes ativo", "version": "2.4 - Poll Robusto"}
