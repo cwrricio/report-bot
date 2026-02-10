@@ -50,7 +50,7 @@ def create_notion_card(db_id, proj, desc, prio, user):
     return response.status_code == 200
 
 # --- Função: Enviar Mensagem com Botões (Whapi) ---
-ddef send_whapi_buttons(chat_id, text, buttons):
+def send_whapi_buttons(chat_id, text, buttons):
     url = "https://gate.whapi.cloud/messages/interactive"
 
     formatted_buttons = []
