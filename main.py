@@ -56,17 +56,24 @@ def send_whapi_buttons(chat_id, text, buttons):
     formatted_buttons = []
     for i, button_text in enumerate(buttons):
         formatted_buttons.append({
-            "id": f"btn_{i}",
-            "text": button_text,
-            "type": "reply"
+            "type": "reply",
+            "reply": {
+                "id": f"btn_{i}",
+                "title": button_text
+            }
         })
 
     payload = {
         "to": chat_id,
-        "type": "buttons",
-        "content": {
-            "text": text,
-            "buttons": formatted_buttons
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {
+                "text": text
+            },
+            "action": {
+                "buttons": formatted_buttons
+            }
         }
     }
 
