@@ -1,169 +1,144 @@
-from fastapi import FastAPI, Request
 import os
 import redis
 import psycopg2
-from psycopg2 import OperationalError
 import requests
-import json
+from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-# --- Configurações e Variáveis de Ambiente ---
+# --- Configurações ---
 DB_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
-WHAPI_TOKEN = os.getenv("WHAPI_TOKEN") 
+WHAPI_TOKEN = os.getenv("WHAPI_TOKEN") #
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 
-# --- Conexão com Redis ---
-try:
-    # decode_responses=True faz o Redis devolver strings (texto) ao invés de bytes
-    r = redis.from_url(REDIS_URL, decode_responses=True)
-except Exception as e:
-    print(f"Aviso: Redis não conectado: {e}")
-    r = None
+r = redis.from_url(REDIS_URL, decode_responses=True)
 
-# --- Opções da Enquete (Atualizado) ---
-# O texto à direita é o que será salvo no banco e enviado na resposta
-OPCOES = {
-    "1": "Bundudo", 
-    "2": "Divo", 
-    "3": "Divo e Bundudo" 
-}
+# --- Função: Busca ID do Projeto no Neon ---
+def get_project_notion_id(project_name):
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT notion_id FROM projetos WHERE nome = %s", (project_name,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return result[0] if result else None
+    except Exception as e:
+        print(f"Erro ao consultar Neon: {e}")
+        return None
 
-# --- Função Auxiliar: Enviar Mensagem via Whapi ---
-def send_whapi_message(chat_id, message):
-    """Envia mensagem de texto usando a API da Whapi.cloud"""
-    url = "https://gate.whapi.cloud/messages/text"
-    
+# --- Função: Cria Card no Notion ---
+def create_notion_card(db_id, proj, desc, prio, user):
+    url = "https://api.notion.com/v1/pages"
     headers = {
-        "Authorization": f"Bearer {WHAPI_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
     }
-    
     payload = {
-        "to": chat_id, 
-        "body": message, 
-        "typing_time": 0
+        "parent": { "database_id": db_id },
+        "properties": {
+            "Name": { "title": [{"text": {"content": f"Reporte: {proj}"}}] },
+            "Descrição": { "rich_text": [{"text": {"content": desc}}] },
+            "Prioridade": { "select": {"name": prio} },
+            "Usuário": { "rich_text": [{"text": {"content": user}}] },
+            "Status": { "status": {"name": "Backlog"} } #
+        }
     }
+    response = requests.post(url, headers=headers, json=payload)
+    return response.status_code == 200
+
+# --- Função Única: Enviar Mensagem (Whapi) ---
+def send_whapi(chat_id, text, buttons=None):
+    """Envia texto ou botões de forma centralizada para facilitar manutenção"""
+    if buttons:
+        url = "https://gate.whapi.cloud/messages/interactive"
+        payload = {
+            "to": chat_id,
+            "type": "buttons",
+            "body": text,
+            "action": {"buttons": [{"id": f"btn_{i}", "title": opt} for i, opt in enumerate(buttons)]}
+        }
+    else:
+        url = "https://gate.whapi.cloud/messages/text"
+        payload = {"to": chat_id, "body": text}
     
-    try:
-        # Enviamos o POST para a Whapi
-        response = requests.post(url, headers=headers, json=payload)
-        
-        # Se der erro (400 ou 500), avisamos no log
-        if response.status_code >= 400:
-            print(f"❌ Erro Whapi ({response.status_code}): {response.text}")
-    except Exception as e:
-        print(f"❌ Erro de conexão ao enviar: {e}")
+    headers = {"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json"}
+    requests.post(url, headers=headers, json=payload)
 
-# --- Rota Inicial (Health Check básico) ---
-@app.get("/")
-def home():
-    return {"status": "Bot Whapi do Ciocca Online 🚀"}
-
-@app.get("/health")
-def health_check():
-    # Retorno simples para o Railway saber que o app não travou
-    return {"status": "ok"}
-
-# --- ROTA DO WEBHOOK (Cérebro do Bot) ---
+# --- Webhook Principal ---
 @app.post("/webhook")
-async def receive_webhook(request: Request):
-    try:
-        # Lê o JSON que a Whapi mandou
-        body = await request.json()
-        
-        # A Whapi envia uma lista de mensagens dentro de 'messages'
-        messages = body.get("messages", [])
-        
-        # Se a lista estiver vazia (pode ser atualização de status), ignoramos
-        if not messages:
-            return {"status": "ignored"}
+async def handle_flow(request: Request):
+    data = await request.json()
+    messages = data.get("messages", [])
+    if not messages: return {"status": "ok"}
 
-        for message_data in messages:
-            # 1. Ignora mensagens enviadas por mim mesmo (para não entrar em loop)
-            if message_data.get("from_me"):
-                continue
+    for msg in messages:
+        if msg.get("from_me"): continue
+        chat_id = msg.get("chat_id")
+        user_name = msg.get("from_name", "Anônimo")
+        
+        # Conteúdo vindo de botão ou texto
+        content = msg.get("action", {}).get("title") if msg.get("type") == "action" else msg.get("text", {}).get("body", "").strip()
 
-            # 2. Extrai dados importantes
-            chat_id = message_data.get("chat_id") # ID único do usuário (ex: 5511999...@s.whatsapp.net)
-            text_body = message_data.get("text", {}).get("body", "") # O texto da mensagem
-            nome = message_data.get("from_name", "Anônimo") # Nome do contato
+        state_key = f"flow:{chat_id}"
+        step = r.get(state_key)
+
+        # PASSO 1: Boas vindas e Escolha do Projeto
+        if not step:
+            r.set(state_key, "SET_PROJ", ex=900)
+            msg_boas_vindas = (
+                f"Olá, *{user_name}*! 🛠️\n\n"
+                "Bem-vindo ao sistema de reportes. Para começar, "
+                "por favor selecione qual projeto você deseja reportar abaixo:"
+            )
+            send_whapi(chat_id, msg_boas_vindas, ["Codefolio", "MentorIA"])
+
+        # PASSO 2: Recebe Projeto -> Pede Descrição
+        elif step == "SET_PROJ":
+            r.set(f"data:{chat_id}:proj", content, ex=900)
+            r.set(state_key, "SET_DESC", ex=900)
+            msg_desc = (
+                f"Projeto *{content}* selecionado! 📝\n\n"
+                "Agora, por favor, descreva o problema ou a melhoria de forma detalhada "
+                "em *UMA ÚNICA MENSAGEM*."
+            )
+            send_whapi(chat_id, msg_desc)
+
+        # PASSO 3: Recebe Descrição -> Pede Prioridade (Final)
+        elif step == "SET_DESC":
+            r.set(f"data:{chat_id}:desc", content, ex=900)
+            r.set(state_key, "SET_PRIO", ex=900)
+            msg_prio = (
+                "Entendido! Para finalizar o reporte, "
+                "qual o nível de urgência/prioridade deste item? ⚠️"
+            )
+            send_whapi(chat_id, msg_prio, ["High", "Medium", "Low"])
+
+        # PASSO 4: Recebe Prioridade -> Envia para o Notion e Confirma
+        elif step == "SET_PRIO":
+            proj = r.get(f"data:{chat_id}:proj")
+            desc = r.get(f"data:{chat_id}:desc")
+            prio = content # O valor do botão clicado
             
-            # Se não tiver texto (ex: mandou só foto sem legenda), ignora
-            if not text_body:
-                continue
+            target_db = get_project_notion_id(proj)
+            
+            if target_db and create_notion_card(target_db, proj, desc, prio, user_name):
+                # Mensagem de confirmação rica em detalhes
+                msg_confirmacao = (
+                    "✅ *Reporte Enviado com Sucesso!*\n\n"
+                    f"📂 *Projeto:* {proj}\n"
+                    f"👤 *Enviado por:* {user_name}\n"
+                    f"⚡ *Prioridade:* {prio}\n"
+                    f"📝 *Descrição:* {desc}\n\n"
+                    "Seu card já foi adicionado ao backlog no Notion."
+                )
+                send_whapi(chat_id, msg_confirmacao)
+            else:
+                send_whapi(chat_id, "❌ Erro ao enviar para o Notion. Verifique as conexões da página.")
+            
+            # Limpa o estado no Redis para o usuário poder reportar novamente
+            r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
 
-            texto = text_body.strip().lower() # Limpa espaços e deixa minúsculo
-
-            print(f"📩 Recebido de {nome}: {texto}")
-
-            # --- MÁQUINA DE ESTADOS (REDIS) ---
-            if r:
-                # Cria uma chave única para esse usuário
-                state_key = f"voto:{chat_id}:status"
-                
-                # Pergunta ao Redis: "Em que passo esse cara está?"
-                estado_atual = r.get(state_key)
-
-                # CENÁRIO A: Usuário Novo (Não tem estado no Redis)
-                # Qualquer coisa que ele mandar, o bot inicia a enquete.
-                if not estado_atual:
-                    # Salva no Redis que ele está "pensando" (expira em 300 segundos/5 min)
-                    r.set(state_key, "AGUARDANDO_VOTO", ex=300)
-                    
-                    msg = (
-                        "🧐 *Enquete Oficial*\n"
-                        "O que o Ciocca é?\n\n"
-                        "1️⃣ - Bundudo\n"
-                        "2️⃣ - Divo\n"
-                        "3️⃣ - Bundudo e Divo\n\n"
-                        "_(Por Favor responda APENAS com o número)_"
-                    )
-                    send_whapi_message(chat_id, msg)
-                
-                # CENÁRIO B: Usuário já recebeu a pergunta (Estado AGUARDANDO_VOTO)
-                elif estado_atual == "AGUARDANDO_VOTO":
-                    
-                    # Verifica se ele respondeu 1, 2 ou 3
-                    if texto in OPCOES:
-                        escolha = OPCOES[texto] # Pega o texto bonito ("Divo", "Bundudo", etc)
-                        
-                        # --- SALVA NO BANCO (POSTGRES) ---
-                        try:
-                            conn = psycopg2.connect(DB_URL)
-                            cur = conn.cursor()
-                            # Cria a tabela se não existir (segurança)
-                            cur.execute("""
-                                CREATE TABLE IF NOT EXISTS votos_ciocca (
-                                    id SERIAL PRIMARY KEY, 
-                                    nome VARCHAR(100), 
-                                    voto VARCHAR(100), 
-                                    data TIMESTAMP DEFAULT NOW()
-                                )
-                            """)
-                            # Insere o voto
-                            cur.execute("INSERT INTO votos_ciocca (nome, voto) VALUES (%s, %s)", (nome, escolha))
-                            conn.commit()
-                            cur.close()
-                            conn.close()
-                            print(f"✅ Voto salvo: {escolha}")
-                        except Exception as e:
-                            print(f"❌ Erro Postgres: {e}")
-
-                        # --- ENCERRAMENTO ---
-                        # Deleta a chave do Redis. O bot "esquece" que estava falando com ele.
-                        # Assim, a sessão encerra e não ocupa memória à toa.
-                        r.delete(state_key)
-                        
-                        # Envia confirmação final
-                        send_whapi_message(chat_id, f"✅ Registrado! O Ciocca é *{escolha}*.")
-                    
-                    else:
-                        # Se ele estava aguardando voto mas mandou "batata" ou "4"
-                        send_whapi_message(chat_id, "❌ Opção inválida! Digite apenas 1, 2 ou 3.")
-
-    except Exception as e:
-        print(f"❌ Erro Geral no Webhook: {e}")
-        return {"status": "error"}
-    
     return {"status": "ok"}
