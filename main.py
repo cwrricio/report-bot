@@ -51,33 +51,30 @@ def create_notion_card(db_id, proj, desc, prio, user):
 
 # --- Função: Enviar Mensagem com Botões (Whapi) ---
 def send_whapi_buttons(chat_id, text, buttons):
-    """Envia mensagem com botões interativos - FORMATO CORRETO"""
     url = "https://gate.whapi.cloud/messages/interactive"
-    
-    # Formata os botões no formato correto que a API espera
+
     formatted_buttons = []
     for i, button_text in enumerate(buttons):
         formatted_buttons.append({
-            "id": f"btn_{i}_{button_text.lower().replace(' ', '_')}",
-            "title": button_text
+            "id": f"btn_{i}",
+            "text": button_text,
+            "type": "reply"
         })
-    
+
     payload = {
         "to": chat_id,
-        "type": "button",
-        "body": {
-            "text": text
-        },
-        "action": {
+        "type": "buttons",
+        "content": {
+            "text": text,
             "buttons": formatted_buttons
         }
     }
-    
+
     headers = {
         "Authorization": f"Bearer {WHAPI_TOKEN}",
         "Content-Type": "application/json"
     }
-    
+
     response = requests.post(url, headers=headers, json=payload)
     print(f"Resposta Whapi (botões): {response.status_code} - {response.text}")
     return response
