@@ -50,9 +50,12 @@ def create_notion_card(db_id, proj, desc, prio, user):
     return response.status_code == 200
 
 # --- Função: Enviar Enquete (Poll) ---
+# --- Função: Enviar Enquete (Poll) ---
 def send_whapi_poll(chat_id, question, options):
     """
     Envia uma enquete de escolha única (comportamento similar a botões)
+    - question: texto da pergunta / mensagem que aparece acima das opções
+    - options: lista de strings (2 a 12 opções)
     """
     url = "https://gate.whapi.cloud/messages/poll"
 
@@ -61,16 +64,14 @@ def send_whapi_poll(chat_id, question, options):
         send_whapi_text(chat_id, "Erro interno: número inválido de opções. Tente novamente.")
         return False
 
-    # Limita cada opção a ~25 caracteres (limite aproximado do WhatsApp)
+    # Limita cada opção (WhatsApp ~25-30 chars por opção)
     formatted_options = [opt.strip()[:25] for opt in options]
 
     payload = {
         "to": chat_id,
-        "poll": {
-            "title": question,
-            "options": formatted_options,
-            "count": 1  # 1 = escolha única (como se fosse botão)
-        }
+        "title": question,               # mensagem + pergunta
+        "options": formatted_options,
+        "count": 1                       # 1 = single choice
     }
 
     headers = {
@@ -82,6 +83,8 @@ def send_whapi_poll(chat_id, question, options):
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         print(f"Resposta Whapi (poll): {response.status_code} - {response.text}")
+        if response.status_code not in (200, 201):
+            print(f"Payload enviado: {payload}")  # ← ajuda a depurar
         return response.status_code in (200, 201)
     except Exception as e:
         print(f"Erro ao enviar enquete: {e}")
