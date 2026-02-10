@@ -50,7 +50,7 @@ def create_notion_card(db_id, proj, desc, prio, user):
     return response.status_code == 200
 
 # --- Função: Enviar Mensagem com Botões (Whapi) ---
-def send_whapi_buttons(chat_id, text, buttons):
+ddef send_whapi_buttons(chat_id, text, buttons):
     url = "https://gate.whapi.cloud/messages/interactive"
 
     formatted_buttons = []
@@ -58,8 +58,8 @@ def send_whapi_buttons(chat_id, text, buttons):
         formatted_buttons.append({
             "type": "reply",
             "reply": {
-                "id": f"btn_{i}",
-                "title": button_text
+                "id": f"btn_{i+1}",           # id único, pode ser qualquer string curta
+                "title": button_text[:20]     # WhatsApp limita título a ~20 chars
             }
         })
 
@@ -67,15 +67,19 @@ def send_whapi_buttons(chat_id, text, buttons):
         "to": chat_id,
         "type": "interactive",
         "interactive": {
-            "type": "button",
+            "type": "button",                 # ← esse "button" é o tipo correto para quick reply buttons
             "body": {
                 "text": text
             },
             "action": {
-                "buttons": formatted_buttons
+                "buttons": formatted_buttons  # ← aqui ficam os botões
             }
         }
     }
+
+    # Opcional: adicionar header e/ou footer se quiser
+    # "header": {"type": "text", "text": "Escolha uma opção:"},
+    # "footer": {"text": "Clique em um botão abaixo"},
 
     headers = {
         "Authorization": f"Bearer {WHAPI_TOKEN}",
