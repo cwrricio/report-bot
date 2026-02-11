@@ -13,11 +13,21 @@ REDIS_URL = os.getenv("REDIS_URL")
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 
-r = redis.from_url(REDIS_URL, decode_responses=True)
+# Conexão Redis com tratamento de erro
+try:
+    r = redis.from_url(REDIS_URL, decode_responses=True)
+    r.ping()  # testa conexão
+    print("Redis conectado com sucesso")
+except Exception as e:
+    print(f"Erro ao conectar Redis: {e}")
+    r = None  # fallback para evitar crash
 
 # ====================== FUNÇÕES AUXILIARES ======================
 
 def get_project_notion_id(project_name):
+    if not DB_URL:
+        print("DB_URL não configurado")
+        return None
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
@@ -32,7 +42,9 @@ def get_project_notion_id(project_name):
 
 
 def log_report_to_neon(proj, user, desc, prio, chat_id):
-    """Salva o reporte na tabela reportes_log"""
+    if not DB_URL:
+        print("DB_URL não configurado")
+        return None
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
@@ -56,7 +68,7 @@ def log_report_to_neon(proj, user, desc, prio, chat_id):
 
 
 def update_report_notion_status(report_id, success):
-    if not report_id:
+    if not report_id or not DB_URL:
         return
     try:
         conn = psycopg2.connect(DB_URL)
@@ -71,6 +83,10 @@ def update_report_notion_status(report_id, success):
 
 
 def create_notion_card(db_id, proj, desc, prio, user):
+    if not NOTION_TOKEN:
+        print("NOTION_TOKEN não configurado")
+        return False
+    
     url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -104,6 +120,9 @@ def create_notion_card(db_id, proj, desc, prio, user):
 
 # ====================== POLL ======================
 def send_whapi_poll(chat_id, question, options, poll_type="proj"):
+    if not WHAPI_TOKEN:
+        print("WHAPI_TOKEN não configurado")
+        return False
     url = "https://gate.whapi.cloud/messages/poll"
     payload = {
         "to": chat_id,
@@ -114,32 +133,38 @@ def send_whapi_poll(chat_id, question, options, poll_type="proj"):
     headers = {"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json"}
     
     response = requests.post(url, headers=headers, json=payload)
-    print(f"[POLL] Resposta: {response.status_code}")
+    print(f"[POLL] Resposta: {response.status_code} - {response.text}")
     
     if response.status_code in (200, 201):
         try:
             msg_id = response.json()["message"]["id"]
-            r.set(f"poll_active:{chat_id}", msg_id, ex=1800)
-            r.set(f"poll_options:{msg_id}", json.dumps(payload["options"]), ex=1800)
-            r.set(f"poll_type:{msg_id}", poll_type, ex=1800)
+            if r:  # só salva se Redis estiver ok
+                r.set(f"poll_active:{chat_id}", msg_id, ex=1800)
+                r.set(f"poll_options:{msg_id}", json.dumps(payload["options"]), ex=1800)
+                r.set(f"poll_type:{msg_id}", poll_type, ex=1800)
             print(f"[POLL] Salvo no Redis -> ID: {msg_id} | Tipo: {poll_type}")
-        except:
-            pass
+        except Exception as e:
+            print(f"Erro ao salvar poll no Redis: {e}")
     return True
 
 
 # ====================== TEXTO ======================
 def send_whapi_text(chat_id, text):
+    if not WHAPI_TOKEN:
+        print("WHAPI_TOKEN não configurado")
+        return
     url = "https://gate.whapi.cloud/messages/text"
     payload = {"to": chat_id, "body": text}
     headers = {"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json"}
-    requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload)
+    print(f"[TEXT] {response.status_code} - {response.text}")
 
 
 # ====================== WEBHOOK ======================
 @app.post("/webhook")
 async def handle_flow(request: Request):
     data = await request.json()
+    print(f"Webhook recebido: {data}")
     
     messages = data.get("messages", []) + data.get("messages_updates", [])
     
@@ -169,9 +194,9 @@ async def handle_flow(request: Request):
                     )
                     if resp.status_code == 200:
                         results = resp.json().get("poll", {}).get("results", [])
-                        for r in results:
-                            if r.get("id") == vote_id and r.get("count", 0) > 0:
-                                content = r.get("name")
+                        for res in results:
+                            if res.get("id") == vote_id and res.get("count", 0) > 0:
+                                content = res.get("name")
                                 print(f"[VOTO] Sucesso! Opção selecionada: {content}")
                                 break
 
@@ -181,10 +206,19 @@ async def handle_flow(request: Request):
         print(f"[CAPTURADO] {content} | Tipo: {msg_type}")
 
         state_key = f"flow:{chat_id}"
-        step = r.get(state_key)
+        
+        # Proteção contra Redis falhando
+        step = None
+        if r:
+            step = r.get(state_key)
+        else:
+            print("Redis não disponível - assumindo step inicial")
+        
+        print(f"Estado atual: {step}")
 
         if not step:
-            r.set(state_key, "SET_PROJ", ex=900)
+            if r:
+                r.set(state_key, "SET_PROJ", ex=900)
             send_whapi_poll(chat_id, f"Olá, *{user_name}*! 🛠️\n\nQual projeto você deseja reportar?", ["Codefolio", "MentorIA"], "proj")
 
         elif step == "SET_PROJ":
@@ -192,16 +226,18 @@ async def handle_flow(request: Request):
                 send_whapi_text(chat_id, "Selecione uma opção na enquete.")
                 send_whapi_poll(chat_id, "Escolha o projeto:", ["Codefolio", "MentorIA"], "proj")
                 continue
-            r.set(f"data:{chat_id}:proj", content, ex=900)
-            r.set(state_key, "SET_DESC", ex=900)
+            if r:
+                r.set(f"data:{chat_id}:proj", content, ex=900)
+                r.set(state_key, "SET_DESC", ex=900)
             send_whapi_text(chat_id, f"✅ *{content}* selecionado!\n\nAgora descreva o problema ou melhoria com detalhes:")
 
         elif step == "SET_DESC":
             if len(content) < 10:
                 send_whapi_text(chat_id, "Descrição muito curta. Tente novamente.")
                 continue
-            r.set(f"data:{chat_id}:desc", content, ex=900)
-            r.set(state_key, "SET_PRIO", ex=900)
+            if r:
+                r.set(f"data:{chat_id}:desc", content, ex=900)
+                r.set(state_key, "SET_PRIO", ex=900)
             send_whapi_poll(chat_id, "Qual a prioridade deste reporte?", ["High", "Medium", "Low"], "prio")
 
         elif step == "SET_PRIO":
@@ -210,33 +246,32 @@ async def handle_flow(request: Request):
                 send_whapi_poll(chat_id, "Qual a prioridade?", ["High", "Medium", "Low"], "prio")
                 continue
 
-            proj = r.get(f"data:{chat_id}:proj")
-            desc = r.get(f"data:{chat_id}:desc")
+            proj = r.get(f"data:{chat_id}:proj") if r else None
+            desc = r.get(f"data:{chat_id}:desc") if r else None
             prio = content
 
-            # 1. Salva primeiro no Neon (reportes_log)
-            report_id = log_report_to_neon(proj, user_name, desc, prio, chat_id)
+            # 1. Salva no Neon
+            report_id = log_report_to_neon(proj or "desconhecido", user_name, desc or content, prio, chat_id)
 
             # 2. Tenta Notion
             notion_ok = False
-            target_db = get_project_notion_id(proj)
+            target_db = get_project_notion_id(proj or "")
             if target_db:
-                notion_ok = create_notion_card(target_db, proj, desc, prio, user_name)
+                notion_ok = create_notion_card(target_db, proj or "", desc or "", prio, user_name)
 
-            # Atualiza status no Neon
             update_report_notion_status(report_id, notion_ok)
 
-            # Resposta final
             if notion_ok:
                 send_whapi_text(chat_id, "✅ Reporte enviado com sucesso! Card criado no Notion.")
             else:
                 send_whapi_text(chat_id, "⚠️ Reporte salvo no banco (reportes_log), mas falhou ao criar card no Notion.")
 
-            r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
+            if r:
+                r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
 
     return {"status": "ok"}
 
 
 @app.get("/")
 async def root():
-    return {"status": "Bot ativo - v2.7 - reportes_log"}
+    return {"status": "Bot ativo - v2.8 - Redis protegido"}
