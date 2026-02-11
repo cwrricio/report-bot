@@ -36,18 +36,34 @@ def create_notion_card(db_id, proj, desc, prio, user):
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28"
     }
+    
+    # Payload alinhado exatamente com o que você confirmou
     payload = {
         "parent": {"database_id": db_id},
         "properties": {
             "Name": {"title": [{"text": {"content": f"Reporte: {proj}"}}]},
             "Descrição": {"rich_text": [{"text": {"content": desc}}]},
-            "Prioridade": {"select": {"name": prio}},
+            "Prioridade": {"select": {"name": prio}},  # já chega como "High", "Medium", "Low"
             "Usuário": {"rich_text": [{"text": {"content": user}}]},
-            "Status": {"status": {"name": "Backlog"}}
+            "Status": {"status": {"name": "Backlog"}}  # B maiúsculo
         }
     }
-    response = requests.post(url, headers=headers, json=payload)
-    return response.status_code == 200
+
+    print(f"Tentando criar card para DB: {db_id}")
+    print(f"Payload enviado:\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        print(f"Notion status: {response.status_code}")
+        print(f"Notion response: {response.text[:800]}...")  # mostra parte do erro se houver
+        if response.status_code == 200:
+            print("✅ Card criado no Notion com sucesso!")
+        else:
+            print("❌ Falha no Notion - verifique o response abaixo")
+        return response.status_code == 200
+    except Exception as e:
+        print(f"Exceção na chamada ao Notion: {e}")
+        return False
 
 # --- Enviar Poll (Salva tudo no Redis) ---
 def send_whapi_poll(chat_id, question, options, poll_type="proj"):
