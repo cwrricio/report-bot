@@ -3,7 +3,6 @@ import redis
 import psycopg2
 import requests
 import json
-import time
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -29,7 +28,7 @@ def get_project_notion_id(project_name):
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-        cur.execute("SELECT notion_id FROM public.projetos WHERE nome = %s", (project_name,))
+        cur.execute("SELECT notion_id FROM projetos WHERE nome = %s", (project_name,))
         result = cur.fetchone()
         cur.close()
         conn.close()
@@ -42,56 +41,35 @@ def get_project_notion_id(project_name):
 def log_report_to_neon(proj, user, desc, prio, chat_id):
     conn = None
     try:
-        print(f"[DB] Conectando ao banco...")
+        print(f"\n[DB] Salvando reporte no banco...")
+        print(f"  Projeto: {proj}")
+        print(f"  Usuário: {user}")
+        print(f"  Prioridade: {prio}")
+        
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
         
-        print(f"[DB] Executando INSERT...")
-        print(f"  projeto_nome: {proj}")
-        print(f"  usuario: {user}")
-        print(f"  prioridade: {prio}")
-        print(f"  chat_id: {chat_id}")
-        print(f"  descricao: {desc[:100]}...")
-        
         cur.execute("""
-            INSERT INTO public.reportes_log 
+            INSERT INTO reportes_log 
             (projeto_nome, usuario, descricao, prioridade, chat_id, notion_card_created, created_at)
             VALUES (%s, %s, %s, %s, %s, FALSE, NOW())
             RETURNING id
         """, (proj, user, desc, prio, chat_id))
         
         report_id = cur.fetchone()[0]
-        
-        print(f"[DB] Executando COMMIT...")
         conn.commit()
-        
         cur.close()
         conn.close()
         
         print(f"✅ Reporte #{report_id} salvo com sucesso!")
         return report_id
         
-    except psycopg2.Error as e:
-        print(f"❌ ERRO PostgreSQL ao salvar reporte:")
-        print(f"   Tipo: {type(e).__name__}")
-        print(f"   Código: {e.pgcode if hasattr(e, 'pgcode') else 'N/A'}")
-        print(f"   Mensagem: {e}")
-        print(f"   Detalhes: {e.pgerror if hasattr(e, 'pgerror') else 'N/A'}")
-        if conn:
-            conn.rollback()
-        return None
-        
     except Exception as e:
-        print(f"❌ ERRO GERAL ao salvar reporte:")
-        print(f"   Tipo: {type(e).__name__}")
-        print(f"   Mensagem: {e}")
+        print(f"❌ ERRO ao salvar reporte: {e}")
         if conn:
             conn.rollback()
-        return None
-    
-    finally:
-        if conn and not conn.closed:
             conn.close()
+        return None
 
 
 def update_report_notion_status(report_id, success):
@@ -100,14 +78,14 @@ def update_report_notion_status(report_id, success):
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-        cur.execute("UPDATE public.reportes_log SET notion_card_created = %s WHERE id = %s", 
+        cur.execute("UPDATE reportes_log SET notion_card_created = %s WHERE id = %s", 
                    (success, report_id))
         conn.commit()
         cur.close()
         conn.close()
-        print(f"Atualizado notion_card_created = {success} (ID {report_id})")
+        print(f"✅ Notion status atualizado: {success}")
     except Exception as e:
-        print(f"Erro ao atualizar reportes_log: {e}")
+        print(f"Erro ao atualizar Notion status: {e}")
 
 
 def create_notion_card(db_id, proj, desc, prio, user):
@@ -129,82 +107,25 @@ def create_notion_card(db_id, proj, desc, prio, user):
         }
     }
 
-    print(f"Tentando criar card para DB: {db_id}")
+    print(f"📤 Criando card no Notion...")
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10)
-        print(f"Notion status: {response.status_code}")
-        return response.status_code == 200
+        success = response.status_code == 200
+        print(f"{'✅' if success else '❌'} Notion: {response.status_code}")
+        return success
     except Exception as e:
-        print(f"Exceção ao chamar Notion: {e}")
+        print(f"❌ Erro Notion: {e}")
         return False
 
 
 # ====================== WHAPI ======================
-def send_whapi_poll(chat_id, question, options, poll_type="proj"):
-    url = "https://gate.whapi.cloud/messages/poll"
-    payload = {
-        "to": chat_id,
-        "title": question,
-        "options": [opt.strip()[:25] for opt in options],
-        "count": 1
-    }
-    headers = {"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json"}
-    
-    response = requests.post(url, headers=headers, json=payload)
-    print(f"[POLL] Resposta: {response.status_code}")
-    
-    if response.status_code in (200, 201) and r:
-        try:
-            msg_id = response.json()["message"]["id"]
-            r.set(f"poll_active:{chat_id}", msg_id, ex=1800)
-            r.set(f"poll_options:{msg_id}", json.dumps(payload["options"]), ex=1800)
-            r.set(f"poll_type:{msg_id}", poll_type, ex=1800)
-            print(f"[POLL] Salvo no Redis -> ID: {msg_id}")
-        except:
-            pass
-    return True
-
-
 def send_whapi_text(chat_id, text):
     url = "https://gate.whapi.cloud/messages/text"
     payload = {"to": chat_id, "body": text}
     headers = {"Authorization": f"Bearer {WHAPI_TOKEN}", "Content-Type": "application/json"}
-    requests.post(url, headers=headers, json=payload)
-
-
-def get_poll_vote_with_retry(target, max_retries=3):
-    """
-    Tenta buscar o voto da poll com retry.
-    No WhatsApp Web, às vezes o count demora pra atualizar.
-    """
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(
-                f"https://gate.whapi.cloud/messages/{target}",
-                headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
-            )
-            
-            if resp.status_code == 200:
-                poll_data = resp.json()
-                results = poll_data.get("poll", {}).get("results", [])
-                
-                # Procura opção com count > 0
-                for res in results:
-                    if res.get("count", 0) > 0:
-                        return res.get("name")
-                
-                # Se não achou e não é a última tentativa, aguarda um pouco
-                if attempt < max_retries - 1:
-                    print(f"[RETRY] Tentativa {attempt + 1}/{max_retries} - aguardando 0.5s...")
-                    time.sleep(0.5)
-            
-        except Exception as e:
-            print(f"[ERRO POLL API] {e}")
-            if attempt < max_retries - 1:
-                time.sleep(0.5)
-    
-    return None
+    response = requests.post(url, headers=headers, json=payload)
+    print(f"[MSG] Enviada: {response.status_code}")
 
 
 # ====================== WEBHOOK ======================
@@ -212,137 +133,253 @@ def get_poll_vote_with_retry(target, max_retries=3):
 async def handle_flow(request: Request):
     data = await request.json()
     
-    messages = data.get("messages", []) + data.get("messages_updates", [])
+    messages = data.get("messages", [])
     
     for item in messages:
+        # Ignora mensagens próprias
         if item.get("from_me"):
+            continue
+
+        # Só processa mensagens de texto
+        if item.get("type") != "text":
             continue
 
         chat_id = item.get("chat_id")
         user_name = item.get("from_name", "Anônimo")
-        msg_type = item.get("type", "")
-
-        content = None
-
-        if msg_type == "text":
-            content = item.get("text", {}).get("body", "").strip()
-            print(f"[TEXT] {content}")
-
-        elif msg_type == "action":
-            action = item.get("action", {})
-            
-            if action.get("type") == "vote":
-                target = action.get("target")
-                
-                print(f"[VOTO] Detectado, target: {target}")
-                
-                if target:
-                    # Tenta buscar com retry (resolve problema WhatsApp Web)
-                    content = get_poll_vote_with_retry(target, max_retries=3)
-                    
-                    if content:
-                        print(f"[✅ VOTO CAPTURADO] {content}")
-                    else:
-                        print(f"[❌ VOTO NÃO CAPTURADO] Nenhuma opção com count > 0")
+        content = item.get("text", {}).get("body", "").strip()
 
         if not content:
-            print(f"[IGNORADO] Tipo: {msg_type}")
             continue
 
-        print(f"\n{'='*60}")
-        print(f"[PROCESSANDO] {content}")
-        print(f"[USUÁRIO] {user_name}")
-        print(f"[CHAT] {chat_id}")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*70}")
+        print(f"📩 MENSAGEM: {content}")
+        print(f"👤 USUÁRIO: {user_name}")
+        print(f"💬 CHAT: {chat_id}")
+        print(f"{'='*70}")
 
         state_key = f"flow:{chat_id}"
         step = r.get(state_key) if r else None
         
-        print(f"[STATE] Etapa: {step or 'INICIO'}")
+        print(f"📍 ETAPA ATUAL: {step or 'INICIO'}")
 
+        # ========== ETAPA 1: INICIAR ==========
         if not step:
-            print("[AÇÃO] Iniciando fluxo")
+            print("[AÇÃO] Iniciando novo fluxo")
             if r:
                 r.set(state_key, "SET_PROJ", ex=900)
-            send_whapi_poll(chat_id, f"Olá, *{user_name}*! 🛠️\n\nQual projeto você deseja reportar?", ["Codefolio", "MentorIA"], "proj")
+            
+            send_whapi_text(
+                chat_id, 
+                f"Olá, *{user_name}*! 🛠️\n\n"
+                f"Qual projeto você deseja reportar?\n\n"
+                f"*1* - Codefolio 💻\n"
+                f"*2* - MentorIA 🤖\n\n"
+                f"_Digite apenas o número (1 ou 2)_"
+            )
 
+        # ========== ETAPA 2: ESCOLHER PROJETO ==========
         elif step == "SET_PROJ":
-            if content not in ["Codefolio", "MentorIA"]:
-                print(f"[ERRO] Projeto inválido: {content}")
-                send_whapi_text(chat_id, "Selecione uma opção na enquete.")
-                send_whapi_poll(chat_id, "Escolha o projeto:", ["Codefolio", "MentorIA"], "proj")
+            projeto = None
+            
+            if content == "1":
+                projeto = "Codefolio"
+            elif content == "2":
+                projeto = "MentorIA"
+            else:
+                print(f"[ERRO] Resposta inválida: {content}")
+                send_whapi_text(
+                    chat_id,
+                    "❌ *Resposta inválida!*\n\n"
+                    "Por favor, responda apenas com o *número*:\n\n"
+                    "*1* - Codefolio\n"
+                    "*2* - MentorIA"
+                )
                 continue
             
-            print(f"[OK] Projeto: {content}")
+            print(f"✅ Projeto selecionado: {projeto}")
+            
             if r:
-                r.set(f"data:{chat_id}:proj", content, ex=900)
+                r.set(f"data:{chat_id}:proj", projeto, ex=900)
                 r.set(state_key, "SET_DESC", ex=900)
-            send_whapi_text(chat_id, f"✅ *{content}* selecionado!\n\nAgora descreva o problema ou melhoria com detalhes:")
+            
+            send_whapi_text(
+                chat_id,
+                f"✅ *{projeto}* selecionado!\n\n"
+                f"📝 Agora, descreva o problema ou melhoria:\n\n"
+                f"_Seja claro e detalhado (mínimo 10 caracteres)_"
+            )
 
+        # ========== ETAPA 3: CAPTURAR DESCRIÇÃO ==========
         elif step == "SET_DESC":
             if len(content) < 10:
-                print(f"[ERRO] Descrição curta")
-                send_whapi_text(chat_id, "Descrição muito curta. Tente novamente.")
+                print(f"[ERRO] Descrição muito curta: {len(content)} caracteres")
+                send_whapi_text(
+                    chat_id,
+                    "❌ *Descrição muito curta!*\n\n"
+                    "Por favor, forneça mais detalhes sobre o problema ou melhoria.\n"
+                    "_Mínimo: 10 caracteres_"
+                )
                 continue
             
-            print(f"[OK] Descrição: {content[:50]}...")
+            print(f"✅ Descrição capturada ({len(content)} caracteres)")
+            
             if r:
                 r.set(f"data:{chat_id}:desc", content, ex=900)
                 r.set(state_key, "SET_PRIO", ex=900)
-            send_whapi_poll(chat_id, "Qual a prioridade deste reporte?", ["High", "Medium", "Low"], "prio")
-
-        elif step == "SET_PRIO":
-            if content not in ["High", "Medium", "Low"]:
-                print(f"[ERRO] Prioridade inválida: {content}")
-                send_whapi_text(chat_id, "Escolha uma prioridade na enquete.")
-                send_whapi_poll(chat_id, "Qual a prioridade?", ["High", "Medium", "Low"], "prio")
-                continue
-
-            proj = r.get(f"data:{chat_id}:proj") if r else None
-            desc = r.get(f"data:{chat_id}:desc") if r else None
-            prio = content
             
-            print(f"\n{'='*60}")
-            print(f"[SALVANDO REPORTE]")
-            print(f"  Projeto: {proj}")
-            print(f"  Usuário: {user_name}")
-            print(f"  Prioridade: {prio}")
-            print(f"  Descrição: {desc[:80] if desc else 'N/A'}...")
-            print(f"{'='*60}\n")
+            send_whapi_text(
+                chat_id,
+                "📊 Qual a prioridade deste reporte?\n\n"
+                "*1* - 🔴 Alta (High)\n"
+                "*2* - 🟡 Média (Medium)\n"
+                "*3* - 🟢 Baixa (Low)\n\n"
+                "_Digite apenas o número (1, 2 ou 3)_"
+            )
 
-            # 1. Salva no Neon
-            report_id = log_report_to_neon(proj or "desconhecido", user_name, desc or content, prio, chat_id)
+        # ========== ETAPA 4: FINALIZAR COM PRIORIDADE ==========
+        elif step == "SET_PRIO":
+            prioridade = None
+            
+            if content == "1":
+                prioridade = "High"
+                emoji_prio = "🔴"
+            elif content == "2":
+                prioridade = "Medium"
+                emoji_prio = "🟡"
+            elif content == "3":
+                prioridade = "Low"
+                emoji_prio = "🟢"
+            else:
+                print(f"[ERRO] Prioridade inválida: {content}")
+                send_whapi_text(
+                    chat_id,
+                    "❌ *Resposta inválida!*\n\n"
+                    "Por favor, responda apenas com o *número*:\n\n"
+                    "*1* - Alta\n"
+                    "*2* - Média\n"
+                    "*3* - Baixa"
+                )
+                continue
+            
+            # Recupera dados do Redis
+            projeto = r.get(f"data:{chat_id}:proj") if r else "Desconhecido"
+            descricao = r.get(f"data:{chat_id}:desc") if r else "Sem descrição"
+            
+            print(f"\n{'='*70}")
+            print(f"💾 SALVANDO REPORTE COMPLETO")
+            print(f"{'='*70}")
+            print(f"Projeto: {projeto}")
+            print(f"Usuário: {user_name}")
+            print(f"Prioridade: {prioridade}")
+            print(f"Descrição: {descricao[:100]}...")
+            print(f"{'='*70}\n")
+
+            # 1. SALVAR NO BANCO DE DADOS
+            report_id = log_report_to_neon(
+                projeto, 
+                user_name, 
+                descricao, 
+                prioridade, 
+                chat_id
+            )
 
             if not report_id:
-                print(f"[❌] Falha ao salvar no banco")
-                send_whapi_text(chat_id, "❌ Erro ao salvar reporte. Tente novamente mais tarde.")
+                print("❌ FALHA CRÍTICA ao salvar no banco")
+                send_whapi_text(
+                    chat_id,
+                    "❌ *Erro ao salvar reporte!*\n\n"
+                    "Ocorreu um problema técnico. Por favor, tente novamente mais tarde.\n\n"
+                    "_Se o problema persistir, entre em contato com o suporte._"
+                )
+                # Limpar estado
                 if r:
                     r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
                 continue
 
-            # 2. Tenta criar no Notion
+            # 2. TENTAR CRIAR NO NOTION (OPCIONAL)
             notion_ok = False
-            target_db = get_project_notion_id(proj or "")
-            if target_db:
-                notion_ok = create_notion_card(target_db, proj or "", desc or "", prio, user_name)
-
-            update_report_notion_status(report_id, notion_ok)
-
-            # 3. Responde usuário
-            if notion_ok:
-                send_whapi_text(chat_id, f"✅ Reporte #{report_id} criado com sucesso!\n\n📊 Projeto: {proj}\n🎯 Prioridade: {prio}\n📋 Card criado no Notion!")
+            notion_db = get_project_notion_id(projeto)
+            
+            if notion_db:
+                print(f"📋 Tentando criar card no Notion...")
+                notion_ok = create_notion_card(notion_db, projeto, descricao, prioridade, user_name)
+                update_report_notion_status(report_id, notion_ok)
             else:
-                send_whapi_text(chat_id, f"✅ Reporte #{report_id} salvo com sucesso!\n\n📊 Projeto: {proj}\n🎯 Prioridade: {prio}")
+                print(f"⚠️ Notion ID não configurado para {projeto}")
 
-            # 4. Limpa Redis
+            # 3. ENVIAR CONFIRMAÇÃO DETALHADA
+            emoji_projeto = "💻" if projeto == "Codefolio" else "🤖"
+            
+            mensagem_confirmacao = (
+                f"✅ *REPORTE REGISTRADO COM SUCESSO!*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 *ID do Reporte:* #{report_id}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{emoji_projeto} *Projeto:* {projeto}\n"
+                f"{emoji_prio} *Prioridade:* {prioridade}\n"
+                f"👤 *Reportado por:* {user_name}\n"
+                f"📝 *Descrição:*\n_{descricao[:200]}{'...' if len(descricao) > 200 else ''}_\n\n"
+            )
+            
+            if notion_ok:
+                mensagem_confirmacao += "✅ Card criado no Notion!\n\n"
+            
+            mensagem_confirmacao += (
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"_Seu reporte foi registrado e será analisado pela equipe._\n\n"
+                f"Obrigado por contribuir! 🙏"
+            )
+            
+            send_whapi_text(chat_id, mensagem_confirmacao)
+
+            # 4. LIMPAR ESTADO DO REDIS
             if r:
                 r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
             
-            print(f"[✅ CONCLUÍDO] Reporte #{report_id}\n")
+            print(f"✅ FLUXO CONCLUÍDO - Reporte #{report_id}\n")
 
     return {"status": "ok"}
 
 
 @app.get("/")
 async def root():
-    return {"status": "Bot ativo - v3.3 (retry + debug db)"}
+    return {
+        "status": "Bot ativo",
+        "version": "4.0 - Sistema simplificado com números",
+        "redis": "connected" if r else "disconnected"
+    }
+
+
+@app.get("/health")
+async def health():
+    """Endpoint de saúde"""
+    db_ok = False
+    redis_ok = False
+    
+    # Testa banco
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM reportes_log")
+        total = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        db_ok = True
+        db_info = f"{total} reportes"
+    except Exception as e:
+        db_info = str(e)[:100]
+    
+    # Testa Redis
+    try:
+        if r:
+            r.ping()
+            redis_ok = True
+    except:
+        pass
+    
+    return {
+        "database": "ok" if db_ok else "error",
+        "database_info": db_info if db_ok else db_info,
+        "redis": "ok" if redis_ok else "error",
+        "status": "healthy" if (db_ok and redis_ok) else "degraded"
+    }
