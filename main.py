@@ -160,108 +160,73 @@ async def handle_flow(request: Request):
 
         if msg_type == "text":
             content = item.get("text", {}).get("body", "").strip()
+            print(f"[TEXT] {content}")
 
         elif msg_type == "action":
-            # 🔍 DIAGNÓSTICO COMPLETO
-            print(f"\n{'='*70}")
-            print(f"🔍 DEBUG ACTION - Estrutura completa:")
-            print(f"{'='*70}")
-            print(json.dumps(item, indent=2, ensure_ascii=False))
-            print(f"{'='*70}\n")
-            
             action = item.get("action", {})
             
             if action.get("type") == "vote":
-                votes = action.get("votes", [])
                 target = action.get("target")
                 
-                print(f"[VOTO DEBUG]")
-                print(f"  votes: {votes}")
-                print(f"  target: {target}")
-                print(f"  action completo: {json.dumps(action, indent=2)}")
+                print(f"[VOTO] Detectado, target: {target}")
                 
-                # MÉTODO 1: Tentar pegar do campo votes (original)
-                if votes and target:
-                    vote_id = votes[0]
-                    print(f"  Tentando método 1: vote_id = {vote_id}")
-                    
+                if target:
+                    # Busca a poll completa
                     resp = requests.get(
                         f"https://gate.whapi.cloud/messages/{target}",
                         headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
                     )
                     
-                    if resp.status_code == 200:
-                        poll_data = resp.json()
-                        print(f"  Poll data recebida: {json.dumps(poll_data, indent=2)[:500]}")
-                        
-                        results = poll_data.get("poll", {}).get("results", [])
-                        for res in results:
-                            if res.get("id") == vote_id and res.get("count", 0) > 0:
-                                content = res.get("name")
-                                print(f"  ✅ MÉTODO 1 FUNCIONOU! content = {content}")
-                                break
-                
-                # MÉTODO 2: Tentar pegar direto do action (caso a estrutura seja diferente)
-                if not content and target:
-                    print(f"  Tentando método 2: buscar na poll completa")
-                    
-                    resp = requests.get(
-                        f"https://gate.whapi.cloud/messages/{target}",
-                        headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
-                    )
+                    print(f"[POLL API] Status: {resp.status_code}")
                     
                     if resp.status_code == 200:
                         poll_data = resp.json()
                         results = poll_data.get("poll", {}).get("results", [])
                         
-                        # Pega a opção com count > 0
-                        for res in results:
-                            if res.get("count", 0) > 0:
-                                content = res.get("name")
-                                print(f"  ✅ MÉTODO 2 FUNCIONOU! content = {content}")
-                                break
-                
-                # MÉTODO 3: Verificar se tem selected_option_id direto no action
-                selected_id = action.get("selected_option_id")
-                if not content and selected_id and target:
-                    print(f"  Tentando método 3: selected_option_id = {selected_id}")
-                    
-                    resp = requests.get(
-                        f"https://gate.whapi.cloud/messages/{target}",
-                        headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
-                    )
-                    
-                    if resp.status_code == 200:
-                        poll_data = resp.json()
-                        results = poll_data.get("poll", {}).get("results", [])
+                        print(f"[POLL RESULTS] Total: {len(results)}")
                         
+                        # Busca a opção que tem count > 0 (significa que foi votada)
                         for res in results:
-                            if res.get("id") == selected_id:
-                                content = res.get("name")
-                                print(f"  ✅ MÉTODO 3 FUNCIONOU! content = {content}")
-                                break
-                
-                if not content:
-                    print(f"  ❌ NENHUM MÉTODO FUNCIONOU")
+                            vote_count = res.get("count", 0)
+                            option_name = res.get("name", "")
+                            
+                            print(f"  Opção: '{option_name}' - Votos: {vote_count}")
+                            
+                            if vote_count > 0 and not content:
+                                content = option_name
+                                print(f"[✅ VOTO CAPTURADO] {content}")
+                    else:
+                        print(f"[❌ ERRO POLL API] {resp.text[:200]}")
 
         if not content:
+            print(f"[IGNORADO] Tipo: {msg_type}")
             continue
 
-        print(f"[CAPTURADO] {content} | Tipo: {msg_type}")
+        print(f"\n{'='*60}")
+        print(f"[PROCESSANDO] {content}")
+        print(f"[USUÁRIO] {user_name}")
+        print(f"[CHAT] {chat_id}")
+        print(f"{'='*60}\n")
 
         state_key = f"flow:{chat_id}"
         step = r.get(state_key) if r else None
+        
+        print(f"[STATE] Etapa: {step or 'INICIO'}")
 
         if not step:
+            print("[AÇÃO] Iniciando fluxo")
             if r:
                 r.set(state_key, "SET_PROJ", ex=900)
             send_whapi_poll(chat_id, f"Olá, *{user_name}*! 🛠️\n\nQual projeto você deseja reportar?", ["Codefolio", "MentorIA"], "proj")
 
         elif step == "SET_PROJ":
             if content not in ["Codefolio", "MentorIA"]:
+                print(f"[ERRO] Projeto inválido: {content}")
                 send_whapi_text(chat_id, "Selecione uma opção na enquete.")
                 send_whapi_poll(chat_id, "Escolha o projeto:", ["Codefolio", "MentorIA"], "proj")
                 continue
+            
+            print(f"[OK] Projeto: {content}")
             if r:
                 r.set(f"data:{chat_id}:proj", content, ex=900)
                 r.set(state_key, "SET_DESC", ex=900)
@@ -269,8 +234,11 @@ async def handle_flow(request: Request):
 
         elif step == "SET_DESC":
             if len(content) < 10:
+                print(f"[ERRO] Descrição curta")
                 send_whapi_text(chat_id, "Descrição muito curta. Tente novamente.")
                 continue
+            
+            print(f"[OK] Descrição: {content[:50]}...")
             if r:
                 r.set(f"data:{chat_id}:desc", content, ex=900)
                 r.set(state_key, "SET_PRIO", ex=900)
@@ -278,6 +246,7 @@ async def handle_flow(request: Request):
 
         elif step == "SET_PRIO":
             if content not in ["High", "Medium", "Low"]:
+                print(f"[ERRO] Prioridade inválida: {content}")
                 send_whapi_text(chat_id, "Escolha uma prioridade na enquete.")
                 send_whapi_poll(chat_id, "Qual a prioridade?", ["High", "Medium", "Low"], "prio")
                 continue
@@ -285,9 +254,24 @@ async def handle_flow(request: Request):
             proj = r.get(f"data:{chat_id}:proj") if r else None
             desc = r.get(f"data:{chat_id}:desc") if r else None
             prio = content
+            
+            print(f"\n{'='*60}")
+            print(f"[SALVANDO REPORTE]")
+            print(f"  Projeto: {proj}")
+            print(f"  Usuário: {user_name}")
+            print(f"  Prioridade: {prio}")
+            print(f"  Descrição: {desc[:80] if desc else 'N/A'}...")
+            print(f"{'='*60}\n")
 
-            # 1. Salva primeiro no Neon
+            # 1. Salva no Neon
             report_id = log_report_to_neon(proj or "desconhecido", user_name, desc or content, prio, chat_id)
+
+            if not report_id:
+                print(f"[❌] Falha ao salvar no banco")
+                send_whapi_text(chat_id, "❌ Erro ao salvar reporte. Tente novamente.")
+                if r:
+                    r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
+                continue
 
             # 2. Tenta criar no Notion
             notion_ok = False
@@ -297,17 +281,21 @@ async def handle_flow(request: Request):
 
             update_report_notion_status(report_id, notion_ok)
 
+            # 3. Responde usuário
             if notion_ok:
-                send_whapi_text(chat_id, "✅ Reporte enviado com sucesso! Card criado no Notion.")
+                send_whapi_text(chat_id, f"✅ Reporte #{report_id} criado com sucesso!\n\n📊 Projeto: {proj}\n🎯 Prioridade: {prio}\n📋 Card criado no Notion!")
             else:
-                send_whapi_text(chat_id, "✅ Reporte salvo no banco de dados com sucesso!")
+                send_whapi_text(chat_id, f"✅ Reporte #{report_id} salvo com sucesso!\n\n📊 Projeto: {proj}\n🎯 Prioridade: {prio}")
 
+            # 4. Limpa Redis
             if r:
                 r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
+            
+            print(f"[✅ CONCLUÍDO] Reporte #{report_id}\n")
 
     return {"status": "ok"}
 
 
 @app.get("/")
 async def root():
-    return {"status": "Bot ativo - v3.1 (debug mode)"}
+    return {"status": "Bot ativo - v3.2 (poll fix)"}
