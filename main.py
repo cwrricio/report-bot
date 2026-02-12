@@ -18,8 +18,8 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 # --- ⚠️ COLOQUE SEUS IDS REAIS AQUI ⚠️ ---
 # Exemplo: "Codefolio": "a1b2c3d4e5f6..."
 NOTION_IDS = {
-    "Codefolio": "303c5e3509988044aea4ec8b82351776", 
-    "MentorIA":  "303c5e35099880358834ed8f5ebbcfb8"
+    "Codefolio": "303c5e35099880779367d853ed84f585?v=303c5e350998809cad0f000cb40c7504", 
+    "MentorIA":  "303c5e35099881f99447eea2c312a9c4?v=303c5e3509988130a8d7000cf827306c"
 }
 
 # Ajuste SSL do Neon
