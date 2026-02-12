@@ -15,10 +15,11 @@ REDIS_URL = os.getenv("REDIS_URL")
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 
-# --- ⚠️ COLOQUE SEUS IDS AQUI ⚠️ ---
+# --- ⚠️ COLOQUE SEUS IDS REAIS AQUI ⚠️ ---
+# Exemplo: "Codefolio": "a1b2c3d4e5f6..."
 NOTION_IDS = {
-    "Codefolio": "SUBSTITUA_PELO_ID_DO_CODEFOLIO", 
-    "MentorIA":  "SUBSTITUA_PELO_ID_DO_MENTORIA"
+    "Codefolio": "303c5e3509988044aea4ec8b82351776", 
+    "MentorIA":  "303c5e35099880358834ed8f5ebbcfb8"
 }
 
 # Ajuste SSL do Neon
@@ -32,9 +33,7 @@ else:
 # =======================================================
 try:
     r = redis.from_url(REDIS_URL, decode_responses=True)
-    print("✅ [BOOT] Redis OK")
 except:
-    print("⚠️ [BOOT] Redis Falhou")
     r = None
 
 # =======================================================
@@ -53,13 +52,11 @@ def send_whapi(chat_id, text):
         print(f"❌ [WHAPI] Erro: {e}")
 
 def create_notion_card(projeto, descricao, prioridade, report_id):
-    print(f"\n🔍 [NOTION] Iniciando criação do card para: {projeto}")
-    
+    # Verifica o ID do Banco
     database_id = NOTION_IDS.get(projeto)
     
-    # 1. Verifica se o ID foi configurado
     if not database_id or "SUBSTITUA" in database_id:
-        print(f"❌ [NOTION] Erro: ID do banco não configurado para '{projeto}'!")
+        print(f"❌ [NOTION] Erro: ID não configurado para '{projeto}' no código!")
         return False
 
     url = "https://api.notion.com/v1/pages"
@@ -69,48 +66,26 @@ def create_notion_card(projeto, descricao, prioridade, report_id):
         "Notion-Version": "2022-06-28"
     }
     
-    # Mapeamento de prioridade (Certifique-se que o Notion tem essas opções exatas)
-    prio_notion = prioridade # Já vem como High/Medium/Low do banco
-    
-    # 2. Monta o Payload (Dados)
     payload = {
         "parent": {"database_id": database_id},
         "properties": {
-            "Name": {
-                "title": [{"text": {"content": f"Reporte #{report_id}"}}]
-            },
-            "Descrição": {
-                "rich_text": [{"text": {"content": descricao}}]
-            },
-            "Prioridade": {
-                "select": {"name": prio_notion}
-            },
-            "Status": {
-                "status": {"name": "Backlog"} # Ou "select" se sua coluna for Select
-            },
-            "ID": {
-                "number": report_id
-            }
+            "Name": {"title": [{"text": {"content": f"Reporte #{report_id}"}}]},
+            "Descrição": {"rich_text": [{"text": {"content": descricao}}]},
+            "Prioridade": {"select": {"name": prioridade}},
+            "Status": {"status": {"name": "Backlog"}},
+            "ID": {"number": report_id}
         }
     }
 
-    # 3. Imprime o Payload para Debug (Isso vai aparecer no log do Railway)
-    print(f"📦 [NOTION] Enviando Payload:\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
-
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=10)
-        
-        # 4. Verifica a resposta
         if res.status_code == 200:
-            print(f"✅ [NOTION] Sucesso! Card criado.")
             return True
         else:
-            print(f"❌ [NOTION] Falha (Status {res.status_code})")
-            print(f"📜 [NOTION] Resposta da API: {res.text}") # AQUI ESTÁ O OURO
+            print(f"❌ [NOTION] Erro API: {res.text}")
             return False
-            
     except Exception as e:
-        print(f"❌ [NOTION] Erro de Conexão: {e}")
+        print(f"❌ [NOTION] Erro Conexão: {e}")
         return False
 
 # Inicializa Banco
@@ -132,8 +107,8 @@ if DB_URL:
         conn.commit()
         cur.close()
         conn.close()
-    except Exception as e:
-        print(f"❌ [DB] Erro ao iniciar: {e}")
+    except Exception:
+        pass
 
 # =======================================================
 # FLUXO
@@ -156,7 +131,7 @@ async def webhook(request: Request):
             
             if text.lower() == "reset":
                 if r: r.delete(f"flow:{chat_id}", f"data:{chat_id}")
-                send_whapi(chat_id, "🔄 Resetado.")
+                send_whapi(chat_id, "🔄 Reiniciado.")
                 continue
 
             state_key = f"flow:{chat_id}"
@@ -168,7 +143,7 @@ async def webhook(request: Request):
                 send_whapi(chat_id, f"Olá, *{user_name}*! 👋\n\nQual projeto?\n1️⃣ Codefolio\n2️⃣ MentorIA")
                 if r: r.set(state_key, "WAIT_PROJ", ex=600)
 
-            # 2. ESCOLHA DO PROJETO
+            # 2. ESCOLHA PROJETO
             elif step == "WAIT_PROJ":
                 if text == "1": proj = "Codefolio"
                 elif text == "2": proj = "MentorIA"
@@ -195,43 +170,59 @@ async def webhook(request: Request):
             # 4. FINALIZAR
             elif step == "WAIT_PRIO":
                 map_db = {"1": "High", "2": "Medium", "3": "Low"}
+                map_user = {"1": "Alta 🔴", "2": "Média 🟡", "3": "Baixa 🟢"}
                 
                 if text not in map_db:
                     send_whapi(chat_id, "⚠️ Digite 1, 2 ou 3.")
                     continue
                 
-                prio = map_db[text]
+                prio_db = map_db[text]
+                prio_user = map_user[text]
                 raw = r.hgetall(data_key)
+                proj = raw.get("projeto")
+                desc = raw.get("descricao")
                 
-                # Salva no Neon
+                # --- PASSO 1: SALVAR NO BANCO (GARANTIDO) ---
                 try:
                     conn = psycopg2.connect(DB_URL)
                     cur = conn.cursor()
                     cur.execute("""
                         INSERT INTO reportes_log (projeto_nome, usuario, descricao, prioridade, chat_id)
                         VALUES (%s, %s, %s, %s, %s) RETURNING id
-                    """, (raw.get("projeto"), user_name, raw.get("descricao"), prio, chat_id))
+                    """, (proj, user_name, desc, prio_db, chat_id))
                     new_id = cur.fetchone()[0]
                     conn.commit()
                     cur.close()
                     conn.close()
 
-                    # Tenta salvar no Notion
-                    notion_result = create_notion_card(raw.get("projeto"), raw.get("descricao"), prio, new_id)
+                    # --- PASSO 2: MONTAR MENSAGEM DE SUCESSO ---
+                    msg_final = (
+                        f"✅ *Reporte Salvo!*\n\n"
+                        f"📂 *Projeto:* {proj}\n"
+                        f"📝 *Descrição:* {desc}\n"
+                        f"🚨 *Prioridade:* {prio_user}\n"
+                        f"👤 *Autor:* {user_name}\n"
+                        f"🔢 *ID:* #{new_id}"
+                    )
+
+                    # --- PASSO 3: TENTAR NOTION ---
+                    notion_ok = create_notion_card(proj, desc, prio_db, new_id)
                     
-                    # Mensagem Final
-                    status_icon = "✅" if notion_result else "⚠️"
-                    status_msg = "Notion OK" if notion_result else "Erro no Notion (Cheque Logs)"
-                    
-                    send_whapi(chat_id, f"✅ Salvo no Banco!\n🆔 #{new_id}\n{status_icon} {status_msg}")
+                    if notion_ok:
+                        msg_final += "\n\n🔗 *Notion:* Sincronizado ✅"
+                    else:
+                        msg_final += "\n\n⚠️ *Notion:* Não sincronizado (Ver Logs)"
+
+                    # --- PASSO 4: ENVIAR TUDO ---
+                    send_whapi(chat_id, msg_final)
                     
                     if r: r.delete(state_key, data_key)
 
                 except Exception as e:
-                    print(f"❌ Erro Crítico DB: {e}")
-                    send_whapi(chat_id, "❌ Erro ao salvar.")
+                    print(f"❌ Erro DB: {e}")
+                    send_whapi(chat_id, "❌ Erro crítico ao salvar no banco.")
 
-    except Exception as e:
-        print(f"🔥 Erro Webhook: {e}")
+    except Exception:
+        pass
 
     return {"status": "ok"}
