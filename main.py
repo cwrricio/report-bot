@@ -15,8 +15,7 @@ REDIS_URL = os.getenv("REDIS_URL")
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 
-# --- ⚠️ COLOQUE SEUS IDS REAIS AQUI ⚠️ ---
-# Exemplo: "Codefolio": "a1b2c3d4e5f6..."
+# --- IDs REAIS CONFIGURADOS ---
 NOTION_IDS = {
     "Codefolio": "303c5e35099880779367d853ed84f585", 
     "MentorIA":  "303c5e35099881f99447eea2c312a9c4"
@@ -57,7 +56,7 @@ def create_notion_card(projeto, descricao, prioridade, report_id):
     
     if not database_id or "SUBSTITUA" in database_id:
         print(f"❌ [NOTION] Erro: ID não configurado para '{projeto}' no código!")
-        return False
+        return None
 
     url = "https://api.notion.com/v1/pages"
     headers = {
@@ -80,13 +79,14 @@ def create_notion_card(projeto, descricao, prioridade, report_id):
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=10)
         if res.status_code == 200:
-            return True
+            # Retorna a URL da página criada no Notion
+            return res.json().get("url")
         else:
             print(f"❌ [NOTION] Erro API: {res.text}")
-            return False
+            return None
     except Exception as e:
         print(f"❌ [NOTION] Erro Conexão: {e}")
-        return False
+        return None
 
 # Inicializa Banco
 if DB_URL:
@@ -206,10 +206,13 @@ async def webhook(request: Request):
                     )
 
                     # --- PASSO 3: TENTAR NOTION ---
-                    notion_ok = create_notion_card(proj, desc, prio_db, new_id)
+                    notion_url = create_notion_card(proj, desc, prio_db, new_id)
                     
-                    if notion_ok:
-                        msg_final += "\n\n🔗 *Notion:* Sincronizado ✅"
+                    if notion_url:
+                        msg_final += (
+                            f"\n\n📍 *Visualize o status da task:*\n"
+                            f"{notion_url}"
+                        )
                     else:
                         msg_final += "\n\n⚠️ *Notion:* Não sincronizado (Ver Logs)"
 
