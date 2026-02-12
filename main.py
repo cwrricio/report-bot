@@ -3,6 +3,7 @@ import redis
 import psycopg2
 import requests
 import json
+import time
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -39,9 +40,19 @@ def get_project_notion_id(project_name):
 
 
 def log_report_to_neon(proj, user, desc, prio, chat_id):
+    conn = None
     try:
+        print(f"[DB] Conectando ao banco...")
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
+        
+        print(f"[DB] Executando INSERT...")
+        print(f"  projeto_nome: {proj}")
+        print(f"  usuario: {user}")
+        print(f"  prioridade: {prio}")
+        print(f"  chat_id: {chat_id}")
+        print(f"  descricao: {desc[:100]}...")
+        
         cur.execute("""
             INSERT INTO public.reportes_log 
             (projeto_nome, usuario, descricao, prioridade, chat_id, notion_card_created, created_at)
@@ -50,16 +61,37 @@ def log_report_to_neon(proj, user, desc, prio, chat_id):
         """, (proj, user, desc, prio, chat_id))
         
         report_id = cur.fetchone()[0]
+        
+        print(f"[DB] Executando COMMIT...")
         conn.commit()
+        
         cur.close()
         conn.close()
-        print(f"✅ Reporte salvo em reportes_log (ID: {report_id})")
+        
+        print(f"✅ Reporte #{report_id} salvo com sucesso!")
         return report_id
-    except Exception as e:
-        print(f"❌ Erro ao salvar em reportes_log: {e}")
+        
+    except psycopg2.Error as e:
+        print(f"❌ ERRO PostgreSQL ao salvar reporte:")
+        print(f"   Tipo: {type(e).__name__}")
+        print(f"   Código: {e.pgcode if hasattr(e, 'pgcode') else 'N/A'}")
+        print(f"   Mensagem: {e}")
+        print(f"   Detalhes: {e.pgerror if hasattr(e, 'pgerror') else 'N/A'}")
         if conn:
             conn.rollback()
         return None
+        
+    except Exception as e:
+        print(f"❌ ERRO GERAL ao salvar reporte:")
+        print(f"   Tipo: {type(e).__name__}")
+        print(f"   Mensagem: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    
+    finally:
+        if conn and not conn.closed:
+            conn.close()
 
 
 def update_report_notion_status(report_id, success):
@@ -141,6 +173,40 @@ def send_whapi_text(chat_id, text):
     requests.post(url, headers=headers, json=payload)
 
 
+def get_poll_vote_with_retry(target, max_retries=3):
+    """
+    Tenta buscar o voto da poll com retry.
+    No WhatsApp Web, às vezes o count demora pra atualizar.
+    """
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(
+                f"https://gate.whapi.cloud/messages/{target}",
+                headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
+            )
+            
+            if resp.status_code == 200:
+                poll_data = resp.json()
+                results = poll_data.get("poll", {}).get("results", [])
+                
+                # Procura opção com count > 0
+                for res in results:
+                    if res.get("count", 0) > 0:
+                        return res.get("name")
+                
+                # Se não achou e não é a última tentativa, aguarda um pouco
+                if attempt < max_retries - 1:
+                    print(f"[RETRY] Tentativa {attempt + 1}/{max_retries} - aguardando 0.5s...")
+                    time.sleep(0.5)
+            
+        except Exception as e:
+            print(f"[ERRO POLL API] {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+    
+    return None
+
+
 # ====================== WEBHOOK ======================
 @app.post("/webhook")
 async def handle_flow(request: Request):
@@ -171,32 +237,13 @@ async def handle_flow(request: Request):
                 print(f"[VOTO] Detectado, target: {target}")
                 
                 if target:
-                    # Busca a poll completa
-                    resp = requests.get(
-                        f"https://gate.whapi.cloud/messages/{target}",
-                        headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
-                    )
+                    # Tenta buscar com retry (resolve problema WhatsApp Web)
+                    content = get_poll_vote_with_retry(target, max_retries=3)
                     
-                    print(f"[POLL API] Status: {resp.status_code}")
-                    
-                    if resp.status_code == 200:
-                        poll_data = resp.json()
-                        results = poll_data.get("poll", {}).get("results", [])
-                        
-                        print(f"[POLL RESULTS] Total: {len(results)}")
-                        
-                        # Busca a opção que tem count > 0 (significa que foi votada)
-                        for res in results:
-                            vote_count = res.get("count", 0)
-                            option_name = res.get("name", "")
-                            
-                            print(f"  Opção: '{option_name}' - Votos: {vote_count}")
-                            
-                            if vote_count > 0 and not content:
-                                content = option_name
-                                print(f"[✅ VOTO CAPTURADO] {content}")
+                    if content:
+                        print(f"[✅ VOTO CAPTURADO] {content}")
                     else:
-                        print(f"[❌ ERRO POLL API] {resp.text[:200]}")
+                        print(f"[❌ VOTO NÃO CAPTURADO] Nenhuma opção com count > 0")
 
         if not content:
             print(f"[IGNORADO] Tipo: {msg_type}")
@@ -268,7 +315,7 @@ async def handle_flow(request: Request):
 
             if not report_id:
                 print(f"[❌] Falha ao salvar no banco")
-                send_whapi_text(chat_id, "❌ Erro ao salvar reporte. Tente novamente.")
+                send_whapi_text(chat_id, "❌ Erro ao salvar reporte. Tente novamente mais tarde.")
                 if r:
                     r.delete(state_key, f"data:{chat_id}:proj", f"data:{chat_id}:desc")
                 continue
@@ -298,4 +345,4 @@ async def handle_flow(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "Bot ativo - v3.2 (poll fix)"}
+    return {"status": "Bot ativo - v3.3 (retry + debug db)"}
