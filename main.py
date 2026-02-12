@@ -7,13 +7,13 @@ from fastapi import FastAPI, Request
 app = FastAPI()
 
 # =======================================================
-# CONFIGURAÇÕES (Lê direto das Variáveis do Railway)
+# CONFIGURAÇÕES (Lê direto do Railway)
 # =======================================================
-RAW_DB_URL = os.getenv("DATABASE_URL")  # Pega do Railway
-REDIS_URL = os.getenv("REDIS_URL")      # Pega do Railway
-WHAPI_TOKEN = os.getenv("WHAPI_TOKEN")  # Pega do Railway
+RAW_DB_URL = os.getenv("DATABASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")
+WHAPI_TOKEN = os.getenv("WHAPI_TOKEN")
 
-# Ajuste automático para SSL do Neon (obrigatório)
+# Ajuste automático para SSL do Neon
 if RAW_DB_URL and "sslmode" not in RAW_DB_URL:
     if "?" in RAW_DB_URL:
         DB_URL = f"{RAW_DB_URL}&sslmode=require"
@@ -23,7 +23,7 @@ else:
     DB_URL = RAW_DB_URL
 
 # =======================================================
-# CONEXÕES E FUNÇÕES
+# CONEXÕES E FUNÇÕES AUXILIARES
 # =======================================================
 
 # 1. Conexão Redis
@@ -35,7 +35,7 @@ except Exception as e:
     print(f"⚠️ [BOOT] Redis Falhou: {e}")
     r = None
 
-# 2. Função de Envio WhatsApp
+# 2. Envio WhatsApp
 def send_whapi(chat_id, text):
     url = "https://gate.whapi.cloud/messages/text"
     headers = {
@@ -43,20 +43,15 @@ def send_whapi(chat_id, text):
         "Content-Type": "application/json"
     }
     try:
-        res = requests.post(url, headers=headers, json={"to": chat_id, "body": text}, timeout=10)
-        return res.status_code == 200
+        requests.post(url, headers=headers, json={"to": chat_id, "body": text}, timeout=5)
     except Exception as e:
         print(f"❌ Erro Whapi: {e}")
-        return False
 
-# 3. Inicialização do Banco de Dados
+# 3. Inicialização do Banco
 def init_db():
-    print("🔄 [DB] Verificando tabelas...")
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-        
-        # Cria tabela de Reportes se não existir
         cur.execute("""
             CREATE TABLE IF NOT EXISTS reportes_log (
                 id SERIAL PRIMARY KEY,
@@ -69,23 +64,22 @@ def init_db():
             );
         """)
         conn.commit()
-        print("✅ [DB] Tabelas Prontas.")
         cur.close()
         conn.close()
+        print("✅ [DB] Tabelas Prontas.")
     except Exception as e:
-        print(f"❌ [DB] Erro de Conexão: {e}")
+        print(f"❌ [DB] Erro Inicialização: {e}")
 
-# Executa a verificação ao iniciar
 if DB_URL:
     init_db()
 
 # =======================================================
-# ROTAS DA API
+# FLUXO DO BOT
 # =======================================================
 
 @app.get("/")
 def home():
-    return {"status": "Bot Online", "banco": "Configurado via Railway"}
+    return {"status": "Bot Otimizado vFinal"}
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -97,7 +91,7 @@ async def webhook(request: Request):
             if msg.get("from_me"): continue
             
             chat_id = msg.get("chat_id")
-            user_name = msg.get("from_name", "Usuário")
+            user_name = msg.get("from_name", "Anônimo")
             text = msg.get("text", {}).get("body", "").strip()
             
             if not text: continue
@@ -105,17 +99,17 @@ async def webhook(request: Request):
             # --- COMANDO RESET ---
             if text.lower() == "reset":
                 if r: r.delete(f"flow:{chat_id}", f"data:{chat_id}")
-                send_whapi(chat_id, "🔄 Reiniciado! Mande 'oi'.")
+                send_whapi(chat_id, "🔄 Reiniciado! Digite 'oi'.")
                 continue
 
-            # --- FLUXO PRINCIPAL ---
+            # --- MÁQUINA DE ESTADOS ---
             state_key = f"flow:{chat_id}"
             data_key = f"data:{chat_id}"
             step = r.get(state_key) if r else None
 
             # 1. INÍCIO
             if not step:
-                send_whapi(chat_id, f"Olá, *{user_name}*! 🛠️\n\nQual projeto?\n1️⃣ Codefolio\n2️⃣ MentorIA")
+                send_whapi(chat_id, f"Olá, *{user_name}*! 👋\n\nQual projeto você quer reportar?\n\n1️⃣ Codefolio\n2️⃣ MentorIA")
                 if r: r.set(state_key, "WAIT_PROJ", ex=600)
 
             # 2. ESCOLHA DO PROJETO
@@ -123,55 +117,74 @@ async def webhook(request: Request):
                 if text == "1": proj = "Codefolio"
                 elif text == "2": proj = "MentorIA"
                 else:
-                    send_whapi(chat_id, "❌ Digite 1 ou 2.")
+                    send_whapi(chat_id, "⚠️ Opção inválida. Digite apenas *1* ou *2*.")
                     continue
                 
-                send_whapi(chat_id, f"✅ *{proj}*!\n\n📝 Descreva o problema (min 10 letras):")
+                send_whapi(chat_id, f"✅ *{proj}* selecionado.\n\n📝 Descreva o problema ou tarefa:")
                 if r:
                     r.hset(data_key, "projeto", proj)
                     r.set(state_key, "WAIT_DESC", ex=600)
 
             # 3. DESCRIÇÃO
             elif step == "WAIT_DESC":
-                if len(text) < 10:
-                    send_whapi(chat_id, "⚠️ Muito curto. Detalhe mais.")
+                if len(text) < 5: # Reduzi um pouco a exigência pra testes rápidos
+                    send_whapi(chat_id, "⚠️ Muito curto. Por favor, detalhe um pouco mais.")
                     continue
                 
-                send_whapi(chat_id, "📊 Qual a prioridade?\n1️⃣ Alta 🔴\n2️⃣ Média 🟡\n3️⃣ Baixa 🟢")
+                send_whapi(chat_id, "📊 Qual a prioridade?\n\n1️⃣ Alta 🔴\n2️⃣ Média 🟡\n3️⃣ Baixa 🟢")
                 if r:
                     r.hset(data_key, "descricao", text)
                     r.set(state_key, "WAIT_PRIO", ex=600)
 
-            # 4. PRIORIDADE E SALVAR
+            # 4. PRIORIDADE E CONFIRMAÇÃO
             elif step == "WAIT_PRIO":
-                prio_map = {"1": "High", "2": "Medium", "3": "Low"}
-                if text not in prio_map:
-                    send_whapi(chat_id, "❌ Digite 1, 2 ou 3.")
+                # Mapeamento duplo: O que vai pro Banco vs O que aparece pro Usuário
+                map_db = {"1": "High", "2": "Medium", "3": "Low"}
+                map_user = {"1": "Alta 🔴", "2": "Média 🟡", "3": "Baixa 🟢"}
+                
+                if text not in map_db:
+                    send_whapi(chat_id, "⚠️ Digite 1, 2 ou 3.")
                     continue
                 
-                prio = prio_map[text]
-                raw = r.hgetall(data_key)
+                prio_db = map_db[text]       # Ex: High
+                prio_display = map_user[text] # Ex: Alta 🔴
                 
-                # Inserção no Banco
+                # Recupera dados
+                raw = r.hgetall(data_key)
+                proj = raw.get("projeto")
+                desc = raw.get("descricao")
+                
+                # Salva no Banco
                 try:
                     conn = psycopg2.connect(DB_URL)
                     cur = conn.cursor()
                     cur.execute("""
                         INSERT INTO reportes_log (projeto_nome, usuario, descricao, prioridade, chat_id)
                         VALUES (%s, %s, %s, %s, %s) RETURNING id
-                    """, (raw.get("projeto"), user_name, raw.get("descricao"), prio, chat_id))
+                    """, (proj, user_name, desc, prio_db, chat_id))
                     
                     new_id = cur.fetchone()[0]
-                    conn.commit() # Confirmação explícita
+                    conn.commit()
                     cur.close()
                     conn.close()
 
-                    send_whapi(chat_id, f"✅ Reporte *#{new_id}* salvo com sucesso! 🚀")
-                    if r: r.delete(state_key, data_key) # Limpa fluxo
+                    # --- MENSAGEM FINAL FORMATADA ---
+                    msg_final = (
+                        f"✅ *Reporte Salvo!*\n\n"
+                        f"📂 *Projeto:* {proj}\n"
+                        f"📝 *Descrição:* {desc}\n"
+                        f"🚨 *Prioridade:* {prio_display}\n"
+                        f"👤 *Enviado por:* {user_name}\n\n"
+                        f"_ID do chamado: #{new_id}_"
+                    )
+                    send_whapi(chat_id, msg_final)
+                    
+                    # Limpa o fluxo
+                    if r: r.delete(state_key, data_key)
                     
                 except Exception as e:
                     print(f"❌ Erro ao salvar: {e}")
-                    send_whapi(chat_id, "❌ Erro ao salvar. Tente novamente.")
+                    send_whapi(chat_id, "❌ Erro ao salvar no sistema. Tente novamente.")
 
     except Exception as e:
         print(f"🔥 Erro Crítico: {e}")
