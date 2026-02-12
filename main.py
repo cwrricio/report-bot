@@ -28,7 +28,6 @@ def get_project_notion_id(project_name):
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-        # CORREÇÃO: Adicionar schema public explícito
         cur.execute("SELECT notion_id FROM public.projetos WHERE nome = %s", (project_name,))
         result = cur.fetchone()
         cur.close()
@@ -43,7 +42,6 @@ def log_report_to_neon(proj, user, desc, prio, chat_id):
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-        # CORREÇÃO: Adicionar schema public explícito
         cur.execute("""
             INSERT INTO public.reportes_log 
             (projeto_nome, usuario, descricao, prioridade, chat_id, notion_card_created, created_at)
@@ -52,7 +50,6 @@ def log_report_to_neon(proj, user, desc, prio, chat_id):
         """, (proj, user, desc, prio, chat_id))
         
         report_id = cur.fetchone()[0]
-        # CORREÇÃO: Adicionar commit explícito
         conn.commit()
         cur.close()
         conn.close()
@@ -60,7 +57,6 @@ def log_report_to_neon(proj, user, desc, prio, chat_id):
         return report_id
     except Exception as e:
         print(f"❌ Erro ao salvar em reportes_log: {e}")
-        # CORREÇÃO: Adicionar rollback em caso de erro
         if conn:
             conn.rollback()
         return None
@@ -72,10 +68,8 @@ def update_report_notion_status(report_id, success):
     try:
         conn = psycopg2.connect(DB_URL)
         cur = conn.cursor()
-        # CORREÇÃO: Adicionar schema public explícito
         cur.execute("UPDATE public.reportes_log SET notion_card_created = %s WHERE id = %s", 
                    (success, report_id))
-        # CORREÇÃO: Adicionar commit explícito
         conn.commit()
         cur.close()
         conn.close()
@@ -104,12 +98,10 @@ def create_notion_card(db_id, proj, desc, prio, user):
     }
 
     print(f"Tentando criar card para DB: {db_id}")
-    print(f"Payload enviado:\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10)
         print(f"Notion status: {response.status_code}")
-        print(f"Notion response: {response.text[:800]}...")
         return response.status_code == 200
     except Exception as e:
         print(f"Exceção ao chamar Notion: {e}")
@@ -170,23 +162,87 @@ async def handle_flow(request: Request):
             content = item.get("text", {}).get("body", "").strip()
 
         elif msg_type == "action":
+            # 🔍 DIAGNÓSTICO COMPLETO
+            print(f"\n{'='*70}")
+            print(f"🔍 DEBUG ACTION - Estrutura completa:")
+            print(f"{'='*70}")
+            print(json.dumps(item, indent=2, ensure_ascii=False))
+            print(f"{'='*70}\n")
+            
             action = item.get("action", {})
+            
             if action.get("type") == "vote":
                 votes = action.get("votes", [])
                 target = action.get("target")
+                
+                print(f"[VOTO DEBUG]")
+                print(f"  votes: {votes}")
+                print(f"  target: {target}")
+                print(f"  action completo: {json.dumps(action, indent=2)}")
+                
+                # MÉTODO 1: Tentar pegar do campo votes (original)
                 if votes and target:
                     vote_id = votes[0]
+                    print(f"  Tentando método 1: vote_id = {vote_id}")
+                    
                     resp = requests.get(
                         f"https://gate.whapi.cloud/messages/{target}",
                         headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
                     )
+                    
                     if resp.status_code == 200:
-                        results = resp.json().get("poll", {}).get("results", [])
+                        poll_data = resp.json()
+                        print(f"  Poll data recebida: {json.dumps(poll_data, indent=2)[:500]}")
+                        
+                        results = poll_data.get("poll", {}).get("results", [])
                         for res in results:
                             if res.get("id") == vote_id and res.get("count", 0) > 0:
                                 content = res.get("name")
-                                print(f"[VOTO] Sucesso! Opção selecionada: {content}")
+                                print(f"  ✅ MÉTODO 1 FUNCIONOU! content = {content}")
                                 break
+                
+                # MÉTODO 2: Tentar pegar direto do action (caso a estrutura seja diferente)
+                if not content and target:
+                    print(f"  Tentando método 2: buscar na poll completa")
+                    
+                    resp = requests.get(
+                        f"https://gate.whapi.cloud/messages/{target}",
+                        headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
+                    )
+                    
+                    if resp.status_code == 200:
+                        poll_data = resp.json()
+                        results = poll_data.get("poll", {}).get("results", [])
+                        
+                        # Pega a opção com count > 0
+                        for res in results:
+                            if res.get("count", 0) > 0:
+                                content = res.get("name")
+                                print(f"  ✅ MÉTODO 2 FUNCIONOU! content = {content}")
+                                break
+                
+                # MÉTODO 3: Verificar se tem selected_option_id direto no action
+                selected_id = action.get("selected_option_id")
+                if not content and selected_id and target:
+                    print(f"  Tentando método 3: selected_option_id = {selected_id}")
+                    
+                    resp = requests.get(
+                        f"https://gate.whapi.cloud/messages/{target}",
+                        headers={"Authorization": f"Bearer {WHAPI_TOKEN}"}
+                    )
+                    
+                    if resp.status_code == 200:
+                        poll_data = resp.json()
+                        results = poll_data.get("poll", {}).get("results", [])
+                        
+                        for res in results:
+                            if res.get("id") == selected_id:
+                                content = res.get("name")
+                                print(f"  ✅ MÉTODO 3 FUNCIONOU! content = {content}")
+                                break
+                
+                if not content:
+                    print(f"  ❌ NENHUM MÉTODO FUNCIONOU")
 
         if not content:
             continue
@@ -254,4 +310,4 @@ async def handle_flow(request: Request):
 
 @app.get("/")
 async def root():
-    return {"status": "Bot ativo - v3.0 (banco corrigido)"}
+    return {"status": "Bot ativo - v3.1 (debug mode)"}
